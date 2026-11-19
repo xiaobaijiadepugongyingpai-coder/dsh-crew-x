@@ -6,6 +6,17 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { createPortal } from 'react-dom';
 
 import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes } from './jobs-view';
+import {
+  formatProbeOutcome,
+  modelSelectOptions,
+  patchForModelChange,
+  patchForProviderChange,
+  providerSelectOptions,
+  resolveEffectiveBinding,
+  type ProviderCatalogEntry,
+  type TierName,
+  type TierProbeState,
+} from './tier-binding-view';
 
 // Build-time snapshot of the worker-profile registry — the same descriptors
 // dsh_worker_config returns as worker_profiles (name / backend / label /
@@ -127,7 +138,31 @@ const COPY = {
     addModelTip: '添加模型到列表', removeModelTip: '从列表移除当前模型', modelPlaceholder: '模型 id，回车确认',
     capVision: '视觉', capImagegen: '生图',
     groupDispatch: '派发', groupRuntime: '运行', groupMultimodal: '多模态',
-    cardDispatch: { t: '派发策略', d: 'orchestrator 未指定时的档位与推理强度，以及档位约束、失败升档与两档各自挂载的 Agent 预设。' },
+    cardDispatch: { t: '派发策略', d: 'orchestrator 未指定时的档位与推理强度，档位约束、失败升档、Agent 预设，以及 flash / pro 各自绑定的 DSH 模型路由。' },
+    tierModels: '模型绑定',
+    tierModelsHint: '从 DSH 已接入的 Provider 与模型目录中选择（留空恢复默认 deepseek-official）；点击右侧测试按钮可一键验证工具调用连通性。',
+    providerLabel: 'Provider', modelLabel: '模型',
+    tierProviderDefault: '默认 · deepseek-official',
+    tierModelDefault: (id: string) => `默认 · ${id}`,
+    providerUnknown: '未在当前列表',
+    providerUnsupported: '不支持 worker',
+    refreshProviders: '刷新 DSH 模型目录',
+    providersLoadFailed: (msg: string) => `无法获取 DSH 模型目录：${msg}`,
+    customModelTip: '手动输入模型 ID',
+    confirmModelTip: '确认模型 ID',
+    cancelModelTip: '取消编辑',
+    customModelPlaceholder: '输入模型 ID，回车确认',
+    resetTierBinding: '恢复默认',
+    tierDefaultChip: '默认', tierCustomChip: '自定义',
+    noModelsListed: '该 Provider 未枚举模型，可点击右侧 ✎ 手动输入模型 ID',
+    probeTier: '测试连通性', probing: '测试中…',
+    probeTip: '调用 /_dsh/dsh-crew/worker-probe 发送一次无副作用的 noop 工具调用，验证该路线能否真正驱动 worker 工具执行',
+    probeVerified: '连通正常 · 工具调用已验证',
+    probeNoToolCall: '模型有响应但未完成工具调用（可能不支持 tool calling）',
+    probeTimeout: '请求超时（20s）',
+    probeRouteError: '路线错误（请检查 Provider 鉴权、模型名或适配器支持）',
+    probeFailed: (msg: string) => `探测失败：${msg}`,
+    hubDiscoveryHint: (origin: string) => `当前实例地址：${origin}。Hub 启动时会自动同步到 ~/.config/dsh-crew/hub.json 供 MCP 动态发现；仅需固定非常驻地址时才需修改上方 Hub 地址。`,
     cardRuntime: { t: '执行与连接', d: 'worker 会话跑在本实例内还是独立进程，单个任务的超时上限，以及 CC / Codex 探测本实例的地址。' },
     cardMM: { t: '视觉与生图', d: '给纯文本的 DSH 模型借来眼睛和画笔：describe_image、会话贴图转写与 generate_image 都用这里的设置。' },
     cardCustomProv: { t: '自定义 Provider', d: '接入自己的 API 或本地命令；保存后会出现在上面的视觉 / 生图 provider 选择里。' },
@@ -219,7 +254,31 @@ const COPY = {
     addModelTip: 'Add a model to the list', removeModelTip: 'Remove the current model from the list', modelPlaceholder: 'model id, Enter to confirm',
     capVision: 'vision', capImagegen: 'image-gen',
     groupDispatch: 'Dispatch', groupRuntime: 'Runtime', groupMultimodal: 'Multimodal',
-    cardDispatch: { t: 'Dispatch policy', d: 'Tier and effort used when the orchestrator names none, plus tier clamping, failure escalation and the Agent preset mounted per tier.' },
+    cardDispatch: { t: 'Dispatch policy', d: 'Tier and effort used when the orchestrator names none, tier clamping, failure escalation, Agent presets, and the DSH model route bound to flash / pro.' },
+    tierModels: 'Tier model bindings',
+    tierModelsHint: 'Select from providers and models registered in DSH (leave on default to use deepseek-official). Click Test route to verify worker tool calling.',
+    providerLabel: 'Provider', modelLabel: 'Model',
+    tierProviderDefault: 'Default · deepseek-official',
+    tierModelDefault: (id: string) => `Default · ${id}`,
+    providerUnknown: 'not in catalog',
+    providerUnsupported: 'unsupported for workers',
+    refreshProviders: 'Refresh DSH provider catalog',
+    providersLoadFailed: (msg: string) => `Failed to load DSH provider catalog: ${msg}`,
+    customModelTip: 'Enter a model ID manually',
+    confirmModelTip: 'Confirm model ID',
+    cancelModelTip: 'Cancel editing',
+    customModelPlaceholder: 'model id, Enter to confirm',
+    resetTierBinding: 'Reset',
+    tierDefaultChip: 'default', tierCustomChip: 'custom',
+    noModelsListed: 'No models enumerated for this provider — click ✎ to enter a model ID manually',
+    probeTier: 'Test route', probing: 'Testing…',
+    probeTip: 'Calls /_dsh/dsh-crew/worker-probe with a no-op tool call to verify this route can drive worker tools',
+    probeVerified: 'Verified · tool calling works',
+    probeNoToolCall: 'Responded without calling the tool (tool calling may be unsupported)',
+    probeTimeout: 'Timed out (20s)',
+    probeRouteError: 'Route error (check provider credentials, model id, or adapter support)',
+    probeFailed: (msg: string) => `Probe failed: ${msg}`,
+    hubDiscoveryHint: (origin: string) => `Active instance: ${origin}. The hub publishes its live port to ~/.config/dsh-crew/hub.json for automatic MCP discovery; edit Hub URL above only to pin a fixed custom address.`,
     cardRuntime: { t: 'Execution & connection', d: 'Whether worker sessions run inside this instance or a separate process, the per-job timeout, and the address CC / Codex probes.' },
     cardMM: { t: 'Vision & image generation', d: "Lends the harness's text-only models eyes and a brush: describe_image, pasted-image transcription and generate_image all use these settings." },
     cardCustomProv: { t: 'Custom providers', d: 'Bring your own API or local command; saved providers appear in the vision / image-gen selects above.' },
@@ -406,6 +465,17 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   ], [presetRoster, copy]);
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [providerCatalog, setProviderCatalog] = useState<ProviderCatalogEntry[]>([]);
+  const [providersLoading, setProvidersLoading] = useState(false);
+  const [providersError, setProvidersError] = useState('');
+  const providersSeqRef = useRef(0);
+  const providersAbortRef = useRef<AbortController | null>(null);
+  const [tierModelInput, setTierModelInput] = useState<{ id: number; tier: TierName; value: string } | null>(null);
+  const tierModelEditIdRef = useRef(0);
+  const cancelledEditIdRef = useRef<number | null>(null);
+  const [tierProbe, setTierProbe] = useState<Record<TierName, TierProbeState | null>>({ flash: null, pro: null });
+  const tierProbeSeq = useRef<Record<TierName, number>>({ flash: 0, pro: 0 });
+  const tierProbeAbortRef = useRef<Record<TierName, AbortController | null>>({ flash: null, pro: null });
   const [provForm, setProvForm] = useState<{
     originalId?: string; name: string; type: 'api' | 'cli'; models: string;
     base_url: string; api_key: string; imagegen_model: string;
@@ -438,10 +508,14 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   /** Every request carries the active locale: the panel is the authority on it
    * (DSH's setting may be unset), and the hub localizes its own strings from it. */
   const withLang = useCallback((path: string) => `${API}${path}${path.includes('?') ? '&' : '?'}lang=${locale === 'zh' ? 'zh' : 'en'}`, [locale]);
-  const get = useCallback(async (path: string) => readJson(await fetch(withLang(path), { cache: 'no-store' }), path), [readJson, withLang]);
-  const post = useCallback(async (path: string, body: any) => readJson(await fetch(withLang(path), {
+  const get = useCallback(async (path: string, signal?: AbortSignal) => readJson(await fetch(withLang(path), {
+    cache: 'no-store',
+    ...(signal ? { signal } : {}),
+  }), path), [readJson, withLang]);
+  const post = useCallback(async (path: string, body: any, signal?: AbortSignal) => readJson(await fetch(withLang(path), {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ...body, lang: locale === 'zh' ? 'zh' : 'en' }),
+    ...(signal ? { signal } : {}),
   }), path), [readJson, withLang, locale]);
 
   // Orphan-ghost lifecycle (WPC10): every OK /jobs snapshot reconciles with
@@ -519,11 +593,54 @@ function WorkersPanel({ ctx }: { ctx: any }) {
     } catch { /* instance restarting */ }
   }, [get, mergeJobs]);
 
+  const refreshProviders = useCallback(async () => {
+    const seq = ++providersSeqRef.current;
+    providersAbortRef.current?.abort();
+    const controller = new AbortController();
+    providersAbortRef.current = controller;
+    setProvidersLoading(true);
+    setProvidersError('');
+    try {
+      const r = await get('/providers', controller.signal);
+      if (providersSeqRef.current !== seq) return;
+      if (r.ok) {
+        setProviderCatalog(Array.isArray(r.providers) ? r.providers : []);
+      } else {
+        setProvidersError(String(r.error ?? 'unknown error'));
+      }
+    } catch (e: any) {
+      if (providersSeqRef.current !== seq) return;
+      setProvidersError(String(e?.message ?? e));
+    } finally {
+      if (providersAbortRef.current === controller) {
+        providersAbortRef.current = null;
+      }
+      if (providersSeqRef.current === seq) {
+        setProvidersLoading(false);
+      }
+    }
+  }, [get]);
+
   useEffect(() => {
     void refreshAll();
+    void refreshProviders();
     const timer = setInterval(() => { void get('/jobs').then((j) => { if (j.ok) mergeJobs(j.jobs ?? []); }).catch(() => {}); }, 3000);
-    return () => clearInterval(timer);
-  }, [refreshAll, get, mergeJobs]);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [refreshAll, refreshProviders, get, mergeJobs]);
+
+  useEffect(() => () => {
+    providersSeqRef.current += 1;
+    providersAbortRef.current?.abort();
+    providersAbortRef.current = null;
+    tierProbeSeq.current.flash += 1;
+    tierProbeSeq.current.pro += 1;
+    tierProbeAbortRef.current.flash?.abort();
+    tierProbeAbortRef.current.pro?.abort();
+    tierProbeAbortRef.current.flash = null;
+    tierProbeAbortRef.current.pro = null;
+  }, []);
 
   const act = useCallback(async (target: string, confirmName?: string) => {
     if (confirmName && !window.confirm(copy.confirmRestore(confirmName))) return;
@@ -548,6 +665,89 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   };
   /** Text/number inputs: track locally, apply on blur. */
   const fieldLocal = (key: string, value: any) => setConfig((c: any) => ({ ...c, [key]: value }));
+
+  const clearTierProbe = (tier: TierName) => {
+    tierProbeSeq.current[tier] += 1;
+    tierProbeAbortRef.current[tier]?.abort();
+    tierProbeAbortRef.current[tier] = null;
+    setTierProbe((prev) => (prev[tier] === null ? prev : { ...prev, [tier]: null }));
+  };
+  const cancelTierCustomModel = (id?: number) => {
+    const targetId = id ?? tierModelInput?.id ?? null;
+    if (targetId !== null) cancelledEditIdRef.current = targetId;
+    setTierModelInput((cur) => (cur && (targetId === null || cur.id === targetId) ? null : cur));
+  };
+  const onTierProviderChange = (tier: TierName, nextProvider: string) => {
+    if (!config) return;
+    if (tierModelInput?.tier === tier) {
+      cancelTierCustomModel(tierModelInput.id);
+    }
+    clearTierProbe(tier);
+    const patch = patchForProviderChange(tier, nextProvider, providerCatalog, config);
+    setConfig((c: any) => ({ ...c, ...patch }));
+    applyPatch(patch);
+  };
+  const onTierModelChange = (tier: TierName, nextModel: string) => {
+    if (!config) return;
+    clearTierProbe(tier);
+    const patch = patchForModelChange(tier, nextModel);
+    setConfig((c: any) => ({ ...c, ...patch }));
+    applyPatch(patch);
+  };
+  const commitTierCustomModel = (expectedId?: number) => {
+    if (!tierModelInput) return;
+    const { id, tier, value } = tierModelInput;
+    if (expectedId !== undefined && id !== expectedId) return;
+    if (cancelledEditIdRef.current === id) return;
+    cancelledEditIdRef.current = id;
+    setTierModelInput((cur) => (cur?.id === id ? null : cur));
+    const trimmed = value.trim();
+    const currentRaw = typeof config?.[`${tier}_model`] === 'string' ? config[`${tier}_model`].trim() : '';
+    if (trimmed !== currentRaw) {
+      onTierModelChange(tier, trimmed);
+    }
+  };
+  const runTierProbe = (tier: TierName) => {
+    if (!config) return;
+    const binding = resolveEffectiveBinding(tier, config);
+    const seq = ++tierProbeSeq.current[tier];
+    tierProbeAbortRef.current[tier]?.abort();
+    const controller = new AbortController();
+    tierProbeAbortRef.current[tier] = controller;
+    const timeoutId = setTimeout(() => controller.abort(), 25_000);
+    setTierProbe((prev) => ({
+      ...prev,
+      [tier]: { busy: true, provider: binding.provider, model: binding.model },
+    }));
+    void post('/worker-probe', { provider: binding.provider, model: binding.model }, controller.signal)
+      .then((r) => {
+        if (tierProbeSeq.current[tier] !== seq) return;
+        setTierProbe((prev) => ({
+          ...prev,
+          [tier]: r.ok && r.result
+            ? { busy: false, provider: binding.provider, model: binding.model, result: r.result }
+            : { busy: false, provider: binding.provider, model: binding.model, error: String(r.error ?? 'probe failed') },
+        }));
+      })
+      .catch((e) => {
+        if (tierProbeSeq.current[tier] !== seq) return;
+        setTierProbe((prev) => ({
+          ...prev,
+          [tier]: {
+            busy: false,
+            provider: binding.provider,
+            model: binding.model,
+            error: controller.signal.aborted ? copy.probeTimeout : String(e?.message ?? e),
+          },
+        }));
+      })
+      .finally(() => {
+        clearTimeout(timeoutId);
+        if (tierProbeAbortRef.current[tier] === controller) {
+          tierProbeAbortRef.current[tier] = null;
+        }
+      });
+  };
 
   // --- custom providers & user-added models -------------------------------
   const customProviders: any[] = config?.custom_providers ?? [];
@@ -790,40 +990,147 @@ function WorkersPanel({ ctx }: { ctx: any }) {
       {config && (<>
         <div style={S.group}>{copy.groupDispatch}</div>
         {block(copy.cardDispatch, (<>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.tier}</span>
-            <CustomSelect value={config.default_tier} onChange={(v) => field('default_tier', v)}
-              options={[{ value: 'flash' }, { value: 'pro' }]} /></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.effort}</span>
-            <CustomSelect value={config.default_effort} onChange={(v) => field('default_effort', v)}
-              options={[{ value: 'off' }, { value: 'high' }, { value: 'max' }]} /></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.tierPolicy}</span>
-            <CustomSelect value={config.tier_policy} onChange={(v) => field('tier_policy', v)}
-              options={(['auto', 'flash-only', 'pro-only'] as const).map((p) => ({ value: p, label: copy.tierPolicyDesc[p] }))} /></label>
-          <label style={{ ...S.field, flexDirection: 'row' as const, alignItems: 'center', gap: 6, paddingBottom: 5 }} title={copy.escalateHint}>
-            <input type="checkbox" checked={!!config.escalate_on_failure} onChange={(e) => field('escalate_on_failure', e.target.checked)} />
-            <span style={{ fontSize: 12 }}>{copy.escalate}</span></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.presetFlash}</span>
-            <CustomSelect value={config.preset_flash ?? 'default'} onChange={(v) => field('preset_flash', v)} options={presetOptions} /></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.presetPro}</span>
-            <CustomSelect value={config.preset_pro ?? 'default'} onChange={(v) => field('preset_pro', v)} options={presetOptions} /></label>
-        </>))}
+          <div style={S.blockGrid}>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.tier}</span>
+              <CustomSelect value={config.default_tier} onChange={(v) => field('default_tier', v)}
+                options={[{ value: 'flash' }, { value: 'pro' }]} /></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.effort}</span>
+              <CustomSelect value={config.default_effort} onChange={(v) => field('default_effort', v)}
+                options={[{ value: 'off' }, { value: 'high' }, { value: 'max' }]} /></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.tierPolicy}</span>
+              <CustomSelect value={config.tier_policy} onChange={(v) => field('tier_policy', v)}
+                options={(['auto', 'flash-only', 'pro-only'] as const).map((p) => ({ value: p, label: copy.tierPolicyDesc[p] }))} /></label>
+            <label style={{ ...S.field, flexDirection: 'row' as const, alignItems: 'center', gap: 6, paddingBottom: 5 }} title={copy.escalateHint}>
+              <input type="checkbox" checked={!!config.escalate_on_failure} onChange={(e) => field('escalate_on_failure', e.target.checked)} />
+              <span style={{ fontSize: 12 }}>{copy.escalate}</span></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.presetFlash}</span>
+              <CustomSelect value={config.preset_flash ?? 'default'} onChange={(v) => field('preset_flash', v)} options={presetOptions} /></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.presetPro}</span>
+              <CustomSelect value={config.preset_pro ?? 'default'} onChange={(v) => field('preset_pro', v)} options={presetOptions} /></label>
+          </div>
+          <div style={{ borderTop: '1px solid rgba(128,128,128,0.16)', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 12.5 }}>{copy.tierModels}</div>
+                <div style={{ fontSize: 11.5, opacity: 0.6 }}>{copy.tierModelsHint}</div>
+              </div>
+              <button type="button" title={copy.refreshProviders} disabled={providersLoading}
+                style={{ ...S.btn, padding: '3px 8px', flexShrink: 0, opacity: providersLoading ? 0.5 : 1 }}
+                onClick={() => { void refreshProviders(); }}>↻</button>
+            </div>
+            {providersError !== '' && (
+              <div style={{ fontSize: 11.5, color: '#f85149' }}>{copy.providersLoadFailed(providersError)}</div>
+            )}
+            {(['flash', 'pro'] as const).map((tier) => {
+              const rawProvider = typeof config[`${tier}_provider`] === 'string' ? config[`${tier}_provider`].trim() : '';
+              const rawModel = typeof config[`${tier}_model`] === 'string' ? config[`${tier}_model`].trim() : '';
+              const effective = resolveEffectiveBinding(tier, config);
+              const provOpts = providerSelectOptions(providerCatalog, rawProvider, copy);
+              const modelOpts = modelSelectOptions(tier, providerCatalog, config, copy);
+              const matchedProv = providerCatalog.find((p) => p.id === effective.provider);
+              const probeState = tierProbe[tier];
+              const outcome = formatProbeOutcome(probeState, copy);
+              const editingModel = tierModelInput?.tier === tier;
+              return (
+                <div key={tier} style={{ border: '1px solid rgba(128,128,128,0.16)', borderRadius: 8, padding: '9px 11px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
+                    <span style={{ fontWeight: 600, fontSize: 12.5 }}>{tier}</span>
+                    <span style={S.chip(effective.custom)}>{effective.custom ? copy.tierCustomChip : copy.tierDefaultChip}</span>
+                    <span style={{ ...S.mono, fontSize: 11.5, opacity: 0.7 }}>{effective.provider} / {effective.model}</span>
+                    <span style={{ flex: 1 }} />
+                    {effective.custom && (
+                      <button type="button" style={{ ...S.btn, padding: '2px 8px', opacity: 0.75 }}
+                        onClick={() => onTierProviderChange(tier, '')}>{copy.resetTierBinding}</button>
+                    )}
+                    <button type="button" title={copy.probeTip} disabled={!!probeState?.busy}
+                      style={{ ...S.btn, padding: '2px 10px' }}
+                      onClick={() => runTierProbe(tier)}>
+                      {probeState?.busy ? copy.probing : copy.probeTier}</button>
+                  </div>
+                  <div style={S.blockGrid}>
+                    <label style={S.field}><span style={S.fieldLabel}>{copy.providerLabel}</span>
+                      <CustomSelect value={rawProvider} onChange={(v) => onTierProviderChange(tier, v)} options={provOpts} /></label>
+                    <label style={S.field}><span style={S.fieldLabel}>{copy.modelLabel}</span>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        {editingModel && tierModelInput ? (
+                          <>
+                            <input autoFocus style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const, ...S.mono }}
+                              value={tierModelInput.value} placeholder={copy.customModelPlaceholder}
+                              onChange={(e) => setTierModelInput((cur) => (cur && cur.id === tierModelInput.id ? { ...cur, value: e.target.value } : cur))}
+                              onBlur={() => commitTierCustomModel(tierModelInput.id)}
+                              onKeyDown={(e: any) => {
+                                if (e.key === 'Enter') { e.preventDefault(); commitTierCustomModel(tierModelInput.id); }
+                                if (e.key === 'Escape') { e.preventDefault(); cancelTierCustomModel(tierModelInput.id); }
+                              }} />
+                            <button type="button" title={copy.confirmModelTip}
+                              style={{ ...S.btn, padding: '3px 8px', flexShrink: 0 }}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => commitTierCustomModel(tierModelInput.id)}>✓</button>
+                            <button type="button" title={copy.cancelModelTip}
+                              style={{ ...S.btn, padding: '3px 8px', flexShrink: 0 }}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => cancelTierCustomModel(tierModelInput.id)}>×</button>
+                          </>
+                        ) : (
+                          <CustomSelect value={rawModel} onChange={(v) => onTierModelChange(tier, v)} options={modelOpts} />
+                        )}
+                        {!editingModel && (
+                          <button type="button" title={copy.customModelTip}
+                            style={{ ...S.btn, padding: '3px 8px', flexShrink: 0 }}
+                            onClick={() => {
+                              const nextId = ++tierModelEditIdRef.current;
+                              cancelledEditIdRef.current = null;
+                              setTierModelInput({ id: nextId, tier, value: rawModel });
+                            }}>✎</button>
+                        )}
+                      </div></label>
+                  </div>
+                  {matchedProv && (!matchedProv.models || matchedProv.models.length === 0) && (
+                    <div style={{ fontSize: 11.5, opacity: 0.55 }}>
+                      {copy.noModelsListed}{matchedProv.models_error ? ` (${matchedProv.models_error})` : ''}
+                    </div>
+                  )}
+                  {probeState?.busy && (
+                    <div style={{ fontSize: 11.5, opacity: 0.65 }}>
+                      {copy.probing} ({probeState.provider} / {probeState.model})
+                    </div>
+                  )}
+                  {outcome && probeState && (
+                    <div style={{ fontSize: 11.5, display: 'flex', flexWrap: 'wrap' as const, gap: 6, alignItems: 'center' }}>
+                      <span style={{ color: outcome.color }}>{outcome.icon} {outcome.text}</span>
+                      <span style={{ ...S.mono, fontSize: 11, opacity: 0.6 }}>{probeState.provider} / {probeState.model}</span>
+                      {probeState.result?.checked_at && (
+                        <span style={{ fontSize: 11, opacity: 0.5 }}>{new Date(probeState.result.checked_at).toLocaleTimeString()}</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>), false)}
 
 
         <div style={S.group}>{copy.groupRuntime}</div>
         {block(copy.cardRuntime, (<>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.mode}</span>
-            <CustomSelect value={config.mode} onChange={(v) => field('mode', v)}
-              options={(['auto', 'hub', 'standalone'] as const).map((m) => ({ value: m, label: copy.modeDesc[m] }))} /></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.timeout}</span>
-            <input style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const }} type="number" min={60} max={7200} value={config.default_timeout_seconds}
-              onChange={(e) => fieldLocal('default_timeout_seconds', Number(e.target.value))}
-              onBlur={() => applyPatch({ default_timeout_seconds: config.default_timeout_seconds })} /></label>
-          <label style={S.field}><span style={S.fieldLabel}>{copy.hubUrl}</span>
-            <input style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const }} value={config.hub_url}
-              onChange={(e) => fieldLocal('hub_url', e.target.value)}
-              onBlur={() => applyPatch({ hub_url: config.hub_url })}
-              onKeyDown={(e: any) => { if (e.key === 'Enter') e.currentTarget.blur(); }} /></label>
-        </>))}
+          <div style={S.blockGrid}>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.mode}</span>
+              <CustomSelect value={config.mode} onChange={(v) => field('mode', v)}
+                options={(['auto', 'hub', 'standalone'] as const).map((m) => ({ value: m, label: copy.modeDesc[m] }))} /></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.timeout}</span>
+              <input style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const }} type="number" min={60} max={7200} value={config.default_timeout_seconds}
+                onChange={(e) => fieldLocal('default_timeout_seconds', Number(e.target.value))}
+                onBlur={() => applyPatch({ default_timeout_seconds: config.default_timeout_seconds })} /></label>
+            <label style={S.field}><span style={S.fieldLabel}>{copy.hubUrl}</span>
+              <input style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const }} value={config.hub_url}
+                onChange={(e) => fieldLocal('hub_url', e.target.value)}
+                onBlur={() => applyPatch({ hub_url: config.hub_url })}
+                onKeyDown={(e: any) => { if (e.key === 'Enter') e.currentTarget.blur(); }} /></label>
+          </div>
+          <div style={{ fontSize: 11.5, opacity: 0.55 }}>
+            {copy.hubDiscoveryHint(typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'http://127.0.0.1')}
+          </div>
+        </>), false)}
 
         <div style={S.group}>{copy.groupMultimodal}</div>
         {block(copy.cardMM, (<>

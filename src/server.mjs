@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { startJob, waitJob, cancelJob, listJobs, getJob, jobView } from './jobs.mjs';
-import { hubAvailable, hub } from './hub-client.mjs';
+import { hubAvailable, hub, getActiveHubUrl, redactHubUrl } from './hub-client.mjs';
 import { startCliJob } from './cli-workers.mjs';
 import { listProfiles, resolveProfile } from './worker-profiles.mjs';
 import { readInheritedOrigin, extendOrigin, DEFAULT_ORIGIN_DEPTH_LIMIT } from './origin-guard.mjs';
@@ -273,6 +273,7 @@ server.registerTool('dsh_worker_config', {
   }
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) sessionConfig[k] = v;
   const reachable = await hubAvailable();
+  const activeHubUrl = reachable ? redactHubUrl(getActiveHubUrl()) : null;
   // Only the hub can enumerate the host's LLM routes (this process has no
   // ctx.llm), so in standalone mode the list is honestly absent rather than
   // empty — "we cannot see them" is not "there are none".
@@ -285,6 +286,7 @@ server.registerTool('dsh_worker_config', {
   return text({
     ...sessionConfig,
     hub_reachable: reachable,
+    hub_url: activeHubUrl,
     bindings,
     available_providers: available,
     ...(available === null && custom.length > 0

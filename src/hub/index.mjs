@@ -11,6 +11,14 @@ import { createShardWriter, readMergedStatus } from '../status-shard.mjs';
 import { procAlive, killWorkerProcess, parsePid, ProcKillRefused } from '../proc-kill.mjs';
 import { installWorkerQuestionHandoff } from '../worker-question.mjs';
 import { probeProvider } from '../provider-probe.mjs';
+import { listProviderCatalog } from '../provider-catalog.mjs';
+import {
+  normalizeLoopbackHubUrl,
+  writeHubDiscovery,
+  removeHubDiscoveryIfOwned,
+  extractWebServerUrl,
+  extractRequestLoopbackUrl,
+} from '../hub-discovery.mjs';
 
 // No @deepseek-ai imports here on purpose: this plugin is loaded into the
 // profile realm, and importing our own package copies would create duplicate
@@ -376,8 +384,58 @@ export async function apply(ctx) {
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = webCtx.webServer;
     const disposers = [];
+    let publishedHubUrl = null;
+    const hubStartedAt = new Date().toISOString();
 
-    disposers.push(webServer.register({
+    const publishHubUrl = (candidate) => {
+      const normalized = normalizeLoopbackHubUrl(candidate);
+      if (!normalized || normalized === publishedHubUrl) return;
+      try {
+        writeHubDiscovery({ url: normalized, pid: process.pid, startedAt: hubStartedAt });
+        publishedHubUrl = normalized;
+      } catch (err) {
+        ctx.logger?.warn?.(`dsh-crew: failed to write hub discovery file: ${err?.message ?? err}`);
+      }
+    };
+
+    const captureRequestUrl = (req) => {
+      if (publishedHubUrl) return;
+      if (!isLoopbackRequest(req)) return;
+      publishHubUrl(extractRequestLoopbackUrl(req));
+    };
+
+    const register = (spec) => webServer.register({
+      ...spec,
+      handler: async (...args) => {
+        captureRequestUrl(args[0]);
+        return spec.handler(...args);
+      },
+    });
+
+    publishHubUrl(extractWebServerUrl(webServer));
+    const listeningTarget = webServer?.server ?? webServer?.httpServer;
+    const onListening = () => publishHubUrl(extractWebServerUrl(webServer));
+    if (listeningTarget && typeof listeningTarget.once === 'function') {
+      listeningTarget.once('listening', onListening);
+    }
+    const probeTimer = setTimeout(() => publishHubUrl(extractWebServerUrl(webServer)), 500);
+    probeTimer.unref?.();
+
+    const cleanupDiscovery = () => {
+      if (!publishedHubUrl) return;
+      removeHubDiscoveryIfOwned({ pid: process.pid, url: publishedHubUrl });
+    };
+    process.once('exit', cleanupDiscovery);
+    disposers.push(() => {
+      clearTimeout(probeTimer);
+      if (listeningTarget && typeof listeningTarget.removeListener === 'function') {
+        try { listeningTarget.removeListener('listening', onListening); } catch {}
+      }
+      process.removeListener('exit', cleanupDiscovery);
+      cleanupDiscovery();
+    });
+
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/worker-probe`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -392,7 +450,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/ping`,
       handler: (req, res) => sendJson(res, 200, { ok: true, service: 'dsh-crew-hub' }),
     }));
@@ -401,7 +459,7 @@ export async function apply(ctx) {
     // orphaned tombstones that carry a pid so it can offer the "process still
     // alive" badge and a kill button; same process.kill(pid, 0) probe the
     // status shard uses for writer liveness (status-shard.mjs writerProcessAlive).
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/proc-alive`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -423,7 +481,7 @@ export async function apply(ctx) {
     // grok) before anything is signalled; then SIGTERM (whole group when a
     // pgid is given) and SIGKILL after a ~3s grace. Refusals are readable,
     // in the origin-guard style.
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/proc-kill`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -449,7 +507,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'prefix', path: `${ROUTE_BASE}/jobs`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -487,7 +545,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/config`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -505,7 +563,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/presets`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -528,13 +586,14 @@ export async function apply(ctx) {
     // routes the HOST has configured are published here. This is the whole
     // point of issue #10: a local model is configured once in DSH, and the
     // worker config names it instead of redefining it.
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/providers`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
+        if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: 'GET only' }, { allow: 'GET' });
         try {
           const { readGlobalConfig } = await import('../install/install.mjs');
-          const providers = ctx.llm.listProviders().map((p) => ({ id: p.id, name: p.name ?? p.id }));
+          const providers = await listProviderCatalog(ctx.llm);
           return sendJson(res, 200, {
             ok: true,
             providers,
@@ -546,7 +605,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/vision-models`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -565,7 +624,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/provider-test`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -583,7 +642,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/install/status`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
@@ -596,7 +655,7 @@ export async function apply(ctx) {
       },
     }));
 
-    disposers.push(webServer.register({
+    disposers.push(register({
       kind: 'exact', path: `${ROUTE_BASE}/install`,
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });

@@ -13,7 +13,7 @@
 // directory, start `node lib/server.mjs` there, and run a real MCP stdio
 // handshake: initialize -> notifications/initialized -> tools/list.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, cpSync, existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -33,6 +33,36 @@ const EXPECTED_TOOLS = [
 function fail(msg) {
   console.error('\nSMOKE FAILED: ' + msg);
   process.exit(1);
+}
+
+function stopChild(proc) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let escalateTimer;
+    let hardTimer;
+    const onClose = () => {
+      if (escalateTimer) clearTimeout(escalateTimer);
+      if (hardTimer) clearTimeout(hardTimer);
+      proc.removeListener('close', onClose);
+      resolve();
+    };
+    proc.once('close', onClose);
+    escalateTimer = setTimeout(() => {
+      if (process.platform === 'win32' && proc.pid) {
+        try {
+          spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        } catch {}
+      } else {
+        try { proc.kill('SIGKILL'); } catch {}
+      }
+      hardTimer = setTimeout(onClose, 2000);
+    }, 2000);
+    try {
+      proc.kill();
+    } catch {
+      onClose();
+    }
+  });
 }
 
 // 1. Rebuild from current sources: an unresolvable / unbundled import breaks
@@ -139,13 +169,13 @@ try {
   console.log('[smoke:mcp] tools/list OK: all ' + names.length + ' tools present: ' + names.join(', '));
 
   finished = true;
-  child.kill();
-  rmSync(tmp, { recursive: true, force: true });
+  await stopChild(child);
+  rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   console.log('\nSMOKE PASSED: the bundled MCP server starts and serves initialize + tools/list from a node_modules-free copy.');
 } catch (err) {
   finished = true;
-  if (child) child.kill();
-  rmSync(tmp, { recursive: true, force: true });
+  try { await stopChild(child); } catch {}
+  try { rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch {}
   fail(err && err.message ? err.message : String(err));
 }
 
