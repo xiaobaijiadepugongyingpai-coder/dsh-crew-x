@@ -569,3 +569,42 @@ test('a hub refusal on close comes back as { closed: false, code, session_id }',
     await hub.close();
   }
 });
+
+// ---------- 5. timed-out persistent turn keeps cwd lock until settled ----------
+
+test('a timed-out persistent turn holds the cwd lock until dsh_worker_result observes it settled', async () => {
+  await withStack(async ({ hub, mcp }) => {
+    await mcp.callTool('dsh_worker_config', { persistent_sessions: true, mode: 'hub' });
+    const release = hub.fake.holdTurns();
+
+    const first = await mcp.callTool('dsh_run_worker', {
+      task: 'slow turn exceeding timeout',
+      cwd: ISOLATED_HOME,
+      persistent: true,
+      timeout_seconds: 1,
+    });
+    assert.equal(first.payload.status, 'running', first.text);
+    const jobId = first.payload.id;
+
+    // While the turn is still running on the hub, a second writer to the same
+    // cwd must be refused by the advisory cwd lock.
+    const concurrentWrite = await mcp.callTool('dsh_run_worker', {
+      task: 'concurrent writer',
+      cwd: ISOLATED_HOME,
+    });
+    assert.equal(concurrentWrite.payload.rejected_by, 'cwd-lock', `expected cwd-lock refusal, got ${concurrentWrite.text}`);
+    assert.equal(concurrentWrite.payload.holder?.jobId, jobId);
+
+    // Let the turn finish and observe settlement through dsh_worker_result.
+    release();
+    const settled = await mcp.callTool('dsh_worker_result', { job_id: jobId, wait_seconds: 10 });
+    assert.equal(settled.payload.status, 'done', settled.text);
+
+    // Once settled, the lock is released and another dispatch proceeds.
+    const next = await mcp.callTool('dsh_run_worker', {
+      task: 'after settle',
+      cwd: ISOLATED_HOME,
+    });
+    assert.equal(next.payload.status, 'done', next.text);
+  });
+});

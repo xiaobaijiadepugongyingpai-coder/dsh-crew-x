@@ -336,11 +336,12 @@ server.registerTool('dsh_run_worker', {
       if (err instanceof CwdLockError) return { refusal: text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder }) };
       throw err;
     }
-    // The lock covers this turn only and is dropped in `finally`, never held
-    // across turns: a persistent session is idle between turns, and a lock kept
-    // alive would block the very next turn on the same workspace.
+    // The lock covers this turn only and is released as soon as the turn
+    // settles — never held across idle turns, and never dropped early while a
+    // timed-out turn is still running on the hub.
     let spawned;
     let turnSessionId = sessionId;
+    let keepLockUntilSettled = false;
     try {
       const dispatch = {
         task: taskWithContract,
@@ -370,6 +371,9 @@ server.registerTool('dsh_run_worker', {
       hubDispatchMeta.set(spawned.id, { permission: perm.permission, effective_sandbox_mode: perm.effective_sandbox_mode, preset: presetExplicit ?? undefined, ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}) });
       const got = await hub.get(spawned.id, timeout);
       attachOrigin(got, spawned.id);
+      if (got.status === 'running') {
+        keepLockUntilSettled = true;
+      }
       // The hub client slices this wait internally; a single request that waits
       // minutes would be cut by undici's 300 s header timeout and reported as a
       // bare "fetch failed" while the job kept running.
@@ -382,7 +386,7 @@ server.registerTool('dsh_run_worker', {
       if (code !== null) return { refusal: text({ error: err.message, code, session_id: turnSessionId }) };
       throw err;
     } finally {
-      lock.release();
+      if (!keepLockUntilSettled) lock.release();
     }
   };
 
