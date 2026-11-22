@@ -39,7 +39,7 @@ try {
     reconcileGhosts, displayJobs, heldWorkspaces, shortPath, chainText, statusInfoOf,
     groupJobs, finishedCountOf, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf,
     ghostPidOf, procBadgeOf, dueProcProbes, PROC_PROBE_INTERVAL_MS,
-    shortSessionId, sessionTagOf, groupJobsBySession,
+    shortSessionId, sessionTagOf, groupJobsBySession, timeAgo, closeOutcomeOf,
     ORPHAN_MISSES, GHOST_CAP,
   } = mod;
 
@@ -302,6 +302,47 @@ try {
   check('groupJobsBySession leaves a one-shot board untouched',
     plain.sessions.length === 0 && plain.loose.length === 2
     && plain.order.every((e) => e.kind === 'loose'));
+
+  // 25. timeAgo must report a malformed timestamp as missing, never as garbage:
+  //     an unparseable last_active_iso used to render "NaNhNaNm" in the
+  //     active-session card.
+  check('timeAgo returns "" for an unparseable timestamp (no NaNhNaNm)',
+    timeAgo('invalid-date') === '' && timeAgo('not a date') === '' && timeAgo({}) === '');
+  check('timeAgo still renders real timestamps',
+    timeAgo(new Date(now - 5000).toISOString()) === '5s'
+    && timeAgo(new Date(now - 3 * 60_000).toISOString()) === '3m'
+    && timeAgo(new Date(now - 3_700_000).toISOString()) === '1h1m'
+    && timeAgo(null) === '' && timeAgo(undefined) === '' && timeAgo('') === '');
+
+  // 26. The session-row predicate the panel derives its sub-header from must
+  //     match groupJobsBySession's (null/'' are "no session", 0-ish ids are not).
+  const sidPredicate = (j) => (j?.persistent === true && j?.sessionId != null && j?.sessionId !== '' ? String(j.sessionId) : '');
+  check('the panel predicate and groupJobsBySession agree on session rows',
+    sidPredicate(job({ persistent: true, sessionId: SID_A })) === SID_A
+    && sidPredicate(job({ persistent: true, sessionId: '' })) === ''
+    && sidPredicate(job({ persistent: true })) === ''
+    && sidPredicate(job({ sessionId: SID_A })) === ''
+    && groupJobsBySession([job({ persistent: true, sessionId: '' }), job({ persistent: true })]).sessions.length === 0);
+
+  // 27. A close either closes or fails visibly: every non-success envelope the
+  //     route can answer must produce a refusal message (the panel keeps it in
+  //     its own state, so the 3s poll cannot wipe it).
+  check('closeOutcomeOf accepts a real close',
+    JSON.stringify(closeOutcomeOf({ ok: true, session_id: SID_A, closed: true }, 'fb'))
+    === JSON.stringify({ closed: true, error: '' }));
+  check('closeOutcomeOf treats {ok:true, closed:false} as a refusal, not a success',
+    closeOutcomeOf({ ok: true, closed: false }, 'fb').closed === false
+    && closeOutcomeOf({ ok: true, closed: false }, 'fb').error === 'closed: false'
+    && closeOutcomeOf({ ok: true, closed: false, error: 'SESSION_BUSY' }, 'fb').error === 'SESSION_BUSY');
+  check('closeOutcomeOf surfaces the hub refusal envelope',
+    closeOutcomeOf({ ok: false, error: 'boom' }, 'fb').closed === false
+    && closeOutcomeOf({ ok: false, error: 'boom' }, 'fb').error === 'boom'
+    && closeOutcomeOf({ ok: false }, 'fb').error === 'fb');
+  check('closeOutcomeOf never reports a malformed/empty answer as closed',
+    closeOutcomeOf(null, 'fb').closed === false && closeOutcomeOf(null, 'fb').error === 'fb'
+    && closeOutcomeOf(undefined, 'fb').closed === false
+    && closeOutcomeOf({}, 'fb').closed === false && closeOutcomeOf({}, 'fb').error === 'fb'
+    && closeOutcomeOf('closed', 'fb').closed === false);
 
   console.log('  (ORPHAN_MISSES = ' + ORPHAN_MISSES + ', GHOST_CAP = ' + GHOST_CAP + ')');
   if (failures > 0) { console.error('\nWPC10 CLIENT CHECKS FAILED: ' + failures); process.exit(1); }

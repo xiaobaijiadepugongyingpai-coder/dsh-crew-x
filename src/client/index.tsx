@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 
-import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes, groupJobsBySession, sessionTagOf, shortSessionId, timeAgo } from './jobs-view';
+import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes, groupJobsBySession, sessionTagOf, shortSessionId, timeAgo, closeOutcomeOf } from './jobs-view';
 import {
   AGY_ALL_PERMISSION_RULES,
   AGY_SAFE_PERMISSION_RULES,
@@ -253,6 +253,7 @@ const COPY = {
     sessionCloseConfirm: (id: string) => `确定关闭持久会话 ${id}？其 DSH 上下文会一并销毁，之后无法再追加轮次。`,
     sessionCloseDone: (id: string) => `已关闭持久会话 ${id}`,
     sessionCloseFailed: (msg: string) => `关闭失败：${msg}`,
+    sessionCloseErrorDismiss: '知道了',
     sessionTagTip: (id: string, turn: any) => `持久会话 ${id} 的第 ${turn} 轮`,
     sessionGroupTurns: (n: number) => `${n} 轮`,
   },
@@ -409,6 +410,7 @@ const COPY = {
     sessionCloseConfirm: (id: string) => `Close persistent session ${id}? Its DSH context is destroyed with it and no further turn can be appended.`,
     sessionCloseDone: (id: string) => `Closed persistent session ${id}`,
     sessionCloseFailed: (msg: string) => `Close failed: ${msg}`,
+    sessionCloseErrorDismiss: 'Dismiss',
     sessionTagTip: (id: string, turn: any) => `Turn ${turn} of persistent session ${id}`,
     sessionGroupTurns: (n: number) => `${n} turn${n === 1 ? '' : 's'}`,
   },
@@ -537,6 +539,10 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   const [sessions, setSessions] = useState<any[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [sessionsError, setSessionsError] = useState('');
+  // Close failures live apart from sessionsError: the 3s poll clears that one on
+  // every OK snapshot, which would silently erase a refused close.
+  const [sessionCloseError, setSessionCloseError] = useState('');
+  const sessionsSeqRef = useRef(0); // monotonic guard against out-of-order GETs
   const [closingSessions, setClosingSessions] = useState<Record<string, boolean>>({});
   // Idle-timeout minutes: a draft while typing so an out-of-range value is
   // refused on commit instead of being written to the config file. null = follow
@@ -708,10 +714,16 @@ function WorkersPanel({ ctx }: { ctx: any }) {
    * Persistent-session pool (Batch 4). Never throws: an instance running an
    * older build (no /sessions route yet), a hub that is restarting or an
    * offline hub all just surface as an inline error and leave the list as is.
+   *
+   * Guarded by a monotonic sequence exactly like refreshProviders: a slow GET
+   * that resolves after closeSession's own refresh must not overwrite the
+   * fresher list (it would show a just-closed session as alive again).
    */
   const refreshSessions = useCallback(async () => {
+    const seq = ++sessionsSeqRef.current;
     try {
       const r = await get('/sessions');
+      if (sessionsSeqRef.current !== seq) return; // a newer request already won
       if (r?.ok) {
         setSessions(Array.isArray(r.sessions) ? r.sessions : []);
         setSessionsError('');
@@ -719,27 +731,38 @@ function WorkersPanel({ ctx }: { ctx: any }) {
         setSessionsError(String(r?.error ?? 'unknown error'));
       }
     } catch (e: any) {
+      if (sessionsSeqRef.current !== seq) return;
       setSessionsError(String(e?.message ?? e));
     } finally {
-      setSessionsLoaded(true);
+      if (sessionsSeqRef.current === seq) setSessionsLoaded(true);
     }
   }, [get]);
 
-  /** POST /sessions/:id/close — the hub requires a JSON content-type (415 otherwise). */
+  /**
+   * POST /sessions/:id/close — the hub requires a JSON content-type (415
+   * otherwise). A close either closes or fails VISIBLY: the refusal is kept in
+   * its own state (never in sessionsError, which the 3s poll clears, and never
+   * double-wrapped as a list-load failure) so it stays on screen until the next
+   * close attempt or an explicit dismissal.
+   */
   const closeSession = useCallback(async (sessionId: string) => {
     if (!window.confirm(copy.sessionCloseConfirm(sessionId))) return;
+    setSessionCloseError('');
     setClosingSessions((s) => ({ ...s, [sessionId]: true }));
+    const fail = (msg: string) => setSessionCloseError(copy.sessionCloseFailed(msg));
     try {
       const r = await post(`/sessions/${encodeURIComponent(sessionId)}/close`, { reason: 'panel-close' });
-      if (r?.ok) {
+      // `{ ok: true, closed: false }` is a refusal, not a success (closeOutcomeOf).
+      const outcome = closeOutcomeOf(r, 'unknown error');
+      if (outcome.closed) {
         setNotice(copy.sessionCloseDone(sessionId));
         setTimeout(() => setNotice(''), 1800);
         await refreshSessions();
       } else {
-        setSessionsError(copy.sessionCloseFailed(String(r?.error ?? 'unknown error')));
+        fail(outcome.error);
       }
     } catch (e: any) {
-      setSessionsError(copy.sessionCloseFailed(String(e?.message ?? e)));
+      fail(String(e?.message ?? e));
     } finally {
       setClosingSessions((s) => ({ ...s, [sessionId]: false }));
     }
@@ -1637,6 +1660,14 @@ function WorkersPanel({ ctx }: { ctx: any }) {
       {sessionsError !== '' && (
         <div style={{ fontSize: 11.5, color: '#f85149' }}>{copy.sessionsLoadFailed(sessionsError)}</div>
       )}
+      {sessionCloseError !== '' && (
+        <div role="alert" style={{ fontSize: 11.5, color: '#f85149', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
+          <span>{sessionCloseError}</span>
+          <button type="button" style={{ ...S.btn, padding: '1px 8px', fontSize: 11, opacity: 0.75 }}
+            title={copy.sessionCloseErrorDismiss}
+            onClick={() => setSessionCloseError('')}>{copy.sessionCloseErrorDismiss}</button>
+        </div>
+      )}
       {sessions.length === 0 ? (
         <div style={{ fontSize: 12, opacity: 0.55 }}>{sessionsLoaded ? copy.sessionsEmpty : copy.working}</div>
       ) : (
@@ -1653,6 +1684,8 @@ function WorkersPanel({ ctx }: { ctx: any }) {
                 const sid = String(sn?.session_id ?? '');
                 const worktree = sn?.isolation === 'git-worktree';
                 const stLabel = copy.sessionStatus[String(sn?.status ?? '')] ?? String(sn?.status ?? '?');
+                const turns = Number(sn?.turns);
+                const lastActive = timeAgo(sn?.last_active_iso);
                 return (
                   <tr key={sid || String(sn?.cwd ?? '')}>
                     <td style={{ ...S.tight, ...S.mono }} title={sid}>{shortSessionId(sid)}</td>
@@ -1660,14 +1693,14 @@ function WorkersPanel({ ctx }: { ctx: any }) {
                     <td style={{ ...S.tight, ...S.mono }} title={[sn?.provider, sn?.preset].filter(Boolean).join(' · ') || undefined}>
                       {sn?.tier ?? '?'}{sn?.model ? ` / ${sn.model}` : ''}
                     </td>
-                    <td style={{ ...S.tight, ...S.mono }}>{copy.sessionTurns(Number(sn?.turns ?? 0))}</td>
+                    <td style={{ ...S.tight, ...S.mono }}>{Number.isFinite(turns) ? copy.sessionTurns(turns) : '-'}</td>
                     <td style={S.tight}>
                       <span style={{ color: sn?.status === 'running' ? '#4a9eff' : sn?.status === 'closed' ? '#f85149' : '#3fb950', fontSize: 11 }}>
                         ● {stLabel}
                       </span>
                     </td>
                     <td style={{ ...S.tight, ...S.mono }} title={String(sn?.last_active_iso ?? '')}>
-                      {sn?.last_active_iso ? timeAgo(sn.last_active_iso) : '-'}
+                      {lastActive || '-'}
                     </td>
                     <td style={{ ...S.tight, whiteSpace: 'normal' as const }}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' as const }}>
@@ -1776,7 +1809,11 @@ function WorkspaceGroup({ group, locks, copy, renderRow }: {
     const sessionById = new Map(bySession.sessions.map((s) => [s.sessionId, s]));
     const emitted = new Set<string>();
     return list.flatMap((job: any) => {
-      const sid = job?.persistent === true && job?.sessionId ? String(job.sessionId) : '';
+      // Same predicate groupJobsBySession uses, so the sub-header and the block
+      // it annotates can never disagree about what counts as a session row.
+      const sid = job?.persistent === true && job?.sessionId != null && job?.sessionId !== ''
+        ? String(job.sessionId)
+        : '';
       if (sid === '') return [renderRow(job)];
       const block = sessionById.get(sid);
       if (!block || emitted.has(sid)) return [];

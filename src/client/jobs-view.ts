@@ -15,7 +15,11 @@ export interface GhostEntry { job: any; lastSeenAt: number; misses: number; }
 /** "3m4s ago"-style readable age for a timestamp (ISO string or epoch ms). */
 export function timeAgo(ts: any): string {
   if (ts === undefined || ts === null || ts === '') return '';
-  const s = Math.max(0, Math.round((Date.now() - +new Date(ts)) / 1000));
+  const at = +new Date(ts);
+  // An unparseable timestamp must render as "missing", never as "NaNhNaNm":
+  // a malformed last_active_iso from the hub would otherwise print garbage.
+  if (!Number.isFinite(at)) return '';
+  const s = Math.max(0, Math.round((Date.now() - at) / 1000));
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
@@ -413,6 +417,28 @@ export function sessionTagOf(job: any): string {
   const short = shortSessionId(job.sessionId);
   if (short === '') return '';
   return `↻ ${short} #${turn}`;
+}
+
+/**
+ * Outcome of one `POST /sessions/:id/close`, as the panel must report it.
+ *
+ * A close either closes or fails VISIBLY, so the refusal message is returned
+ * for every non-success shape that can reach here:
+ *   - a thrown/rejected request (no body at all) → `fallback`,
+ *   - `{ ok: false, error }` (the hub's uniform refusal envelope) → its `error`,
+ *   - `{ ok: true, closed: false }` → treated as a REFUSAL, not a success: the
+ *     route answered but the session was not closed, which must never be
+ *     reported as done.
+ * Only `ok` truthy AND `closed` not literally false counts as closed.
+ */
+export function closeOutcomeOf(body: any, fallback: string): { closed: boolean; error: string } {
+  if (!body || typeof body !== 'object') return { closed: false, error: fallback };
+  if (body.closed === false) {
+    return { closed: false, error: String(body.error ?? 'closed: false') };
+  }
+  if (body.ok === false) return { closed: false, error: String(body.error ?? fallback) };
+  if (body.ok !== true) return { closed: false, error: fallback };
+  return { closed: true, error: '' };
 }
 
 /** One persistent session's turns, as the board renders them (one block). */
