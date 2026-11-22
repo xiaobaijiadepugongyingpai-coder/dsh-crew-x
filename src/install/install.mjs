@@ -109,6 +109,8 @@ export const GLOBAL_CONFIG_DEFAULTS = {
   // Hub-mode agent preset per tier: 'default' follows the DSH roster default.
   preset_flash: 'minimal',
   preset_pro: 'default',
+  // Directory for offloaded large/failed worker reports ('' = <cwd>/.dsh-reports).
+  report_dir: '',
 };
 
 export function readGlobalConfig() {
@@ -136,13 +138,31 @@ export function installStatus({ home = homedir() } = {}) {
   const agyMcp = readJson(join(home, '.gemini', 'config', 'mcp_config.json'), {});
   const agyInstalled = !!(agyMcp.mcpServers && agyMcp.mcpServers['dsh-crew'])
     || existsSync(join(home, '.gemini', 'config', 'agents', 'ds-flash.md'));
+  const agySettings = readJson(join(home, '.gemini', 'antigravity-cli', 'settings.json'), {});
+  const agyAllow = Array.isArray(agySettings.permissions?.allow) ? agySettings.permissions.allow : [];
+  const agySafeAllowed = AGY_SAFE_PERMISSION_RULES.every((r) => agyAllow.includes(r));
+  const agyDispatchAllowed = AGY_DISPATCH_PERMISSION_RULES.every((r) => agyAllow.includes(r));
+  const agyDshRules = agyAllow.filter(isDshCrewAgyPermissionRule);
+  const agyPermMode = agySafeAllowed && agyDispatchAllowed ? 'all'
+    : agySafeAllowed ? 'safe'
+    : agyDispatchAllowed ? 'dispatch'
+    : agyDshRules.length > 0 ? 'custom'
+    : 'none';
   const grokTxt = readText(join(home, '.grok', 'config.toml'));
   const grokInstalled = grokTxt.includes('[mcp_servers.dsh-crew]')
     || existsSync(join(home, '.grok', 'agents', 'ds-flash.md'));
   return {
     claude: { installed: claudeInstalled, hud: hudWired },
     codex: { installed: codexInstalled },
-    agy: { installed: agyInstalled },
+    agy: {
+      installed: agyInstalled,
+      permissions: {
+        mode: agyPermMode,
+        allowSafe: agySafeAllowed,
+        allowDispatch: agyDispatchAllowed,
+        rules: agyDshRules,
+      },
+    },
     grok: { installed: grokInstalled },
   };
 }
@@ -286,13 +306,124 @@ export function installCodex({ home = homedir(), scope } = {}) {
 // Global MCP config: ~/.gemini/config/mcp_config.json
 //   { "mcpServers": { "<name>": { "command", "args", "disabled", "env"? } } }
 // Global agents: ~/.gemini/config/agents/<name>.md (frontmatter: name,
-//   description required; model flash|pro, subagent, tools, ... optional).
+//   description required; model, subagent, tools, ... optional).
 // Global skills: ~/.gemini/config/skills/<name>/SKILL.md.
+// CLI permissions: ~/.gemini/antigravity-cli/settings.json
+//   { "permissions": { "allow": ["mcp(dsh-crew/<tool_name>)"] } }
 // After a server runs once, agy keeps tool-schema caches under
 // ~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/mcp/<name>/ —
 // uninstall removes those too.
 
-export function installAgy({ home = homedir() } = {}) {
+export const AGY_SAFE_MCP_TOOLS = Object.freeze([
+  'dsh_worker_status',
+  'dsh_worker_result',
+  'dsh_worker_config',
+  'dsh_worker_probe',
+]);
+
+export const AGY_DISPATCH_MCP_TOOLS = Object.freeze([
+  'dsh_run_worker',
+  'dsh_spawn_worker',
+  'dsh_worker_cancel',
+]);
+
+export const AGY_ALL_MCP_TOOLS = Object.freeze([
+  ...AGY_SAFE_MCP_TOOLS,
+  ...AGY_DISPATCH_MCP_TOOLS,
+]);
+
+export function agyMcpPermissionRule(toolName) {
+  return `mcp(dsh-crew/${toolName})`;
+}
+
+export const AGY_SAFE_PERMISSION_RULES = Object.freeze(AGY_SAFE_MCP_TOOLS.map(agyMcpPermissionRule));
+export const AGY_DISPATCH_PERMISSION_RULES = Object.freeze(AGY_DISPATCH_MCP_TOOLS.map(agyMcpPermissionRule));
+export const AGY_ALL_PERMISSION_RULES = Object.freeze(AGY_ALL_MCP_TOOLS.map(agyMcpPermissionRule));
+
+export function isDshCrewAgyPermissionRule(rule) {
+  if (typeof rule !== 'string') return false;
+  const trimmed = rule.trim();
+  return trimmed.startsWith('mcp(dsh-crew/') && trimmed.endsWith(')');
+}
+
+/**
+ * Resolve tiered Antigravity MCP permission selection.
+ * Default when omitted: 'safe' (allow the 4 low-risk query/config tools while
+ * keeping run/spawn/cancel on Ask unless explicitly opted in).
+ */
+export function resolveAgyPermissionSelection(opts = {}) {
+  const {
+    agyPermissions,
+    permissions,
+    allowSafePermissions,
+    allowDispatchPermissions,
+  } = opts ?? {};
+
+  let allowSafe;
+  let allowDispatch;
+
+  if (allowSafePermissions !== undefined || allowDispatchPermissions !== undefined) {
+    allowSafe = allowSafePermissions === undefined ? false : Boolean(allowSafePermissions);
+    allowDispatch = allowDispatchPermissions === undefined ? false : Boolean(allowDispatchPermissions);
+  } else {
+    const raw = agyPermissions !== undefined ? agyPermissions : permissions;
+    if (raw === undefined || raw === true || raw === 'safe') {
+      allowSafe = true;
+      allowDispatch = false;
+    } else if (raw === false || raw === 'none') {
+      allowSafe = false;
+      allowDispatch = false;
+    } else if (raw === 'all') {
+      allowSafe = true;
+      allowDispatch = true;
+    } else if (raw === 'dispatch') {
+      allowSafe = false;
+      allowDispatch = true;
+    } else {
+      throw new Error(`unknown agy permissions preset ${JSON.stringify(raw)} (expected 'none' | false | 'safe' | 'all' | 'dispatch')`);
+    }
+  }
+
+  const rules = [
+    ...(allowSafe ? AGY_SAFE_PERMISSION_RULES : []),
+    ...(allowDispatch ? AGY_DISPATCH_PERMISSION_RULES : []),
+  ];
+  const mode = allowSafe && allowDispatch
+    ? 'all'
+    : allowSafe
+      ? 'safe'
+      : allowDispatch
+        ? 'dispatch'
+        : 'none';
+
+  return { mode, allowSafe, allowDispatch, rules };
+}
+
+export function describeAgyPermissions(opts = {}) {
+  const sel = resolveAgyPermissionSelection(opts);
+  const safeText = AGY_SAFE_PERMISSION_RULES.join('\n');
+  const dispatchText = AGY_DISPATCH_PERMISSION_RULES.join('\n');
+  const allText = AGY_ALL_PERMISSION_RULES.join('\n');
+  const text = sel.rules.join('\n');
+  return {
+    ...sel,
+    text,
+    safeRules: [...AGY_SAFE_PERMISSION_RULES],
+    dispatchRules: [...AGY_DISPATCH_PERMISSION_RULES],
+    allRules: [...AGY_ALL_PERMISSION_RULES],
+    safeText,
+    dispatchText,
+    allText,
+  };
+}
+
+export function formatAgyDesktopPermissionsText(opts = {}) {
+  return describeAgyPermissions(opts).text;
+}
+
+export function installAgy(opts = {}) {
+  const { home = homedir() } = opts ?? {};
+  const permInfo = describeAgyPermissions(opts);
   const actions = [];
   const serverPath = join(ROOT, 'lib', 'server.mjs');
   if (!existsSync(serverPath)) {
@@ -331,7 +462,50 @@ export function installAgy({ home = homedir() } = {}) {
     writeFileSync(dest, readFileSync(join(ROOT, 'agy', 'skills', s, 'SKILL.md'), 'utf8'));
     actions.push(`skill: ${dest}`);
   }
-  return { ok: true, actions };
+
+  // 4. Antigravity CLI permissions allowlist (~/.gemini/antigravity-cli/settings.json).
+  const agySettingsFile = join(home, '.gemini', 'antigravity-cli', 'settings.json');
+  const agySettingsExisted = existsSync(agySettingsFile);
+  const rawAgySettings = agySettingsExisted ? readJson(agySettingsFile, null) : {};
+  const existingAllow = Array.isArray(rawAgySettings?.permissions?.allow) ? rawAgySettings.permissions.allow : [];
+  const hadDshCrewRules = existingAllow.some(isDshCrewAgyPermissionRule);
+
+  if (permInfo.rules.length === 0) {
+    if (agySettingsExisted && rawAgySettings && hadDshCrewRules) {
+      const b = backup(agySettingsFile);
+      if (b) actions.push(`backup: ${b}`);
+      const kept = existingAllow.filter((r) => !isDshCrewAgyPermissionRule(r));
+      rawAgySettings.permissions = { ...rawAgySettings.permissions, allow: kept };
+      writeFileSync(agySettingsFile, JSON.stringify(rawAgySettings, null, 2) + '\n');
+      actions.push(`permissions: removed dsh-crew rules from ${agySettingsFile}`);
+    } else {
+      actions.push(`permissions: skipped (${permInfo.mode}; ${agySettingsFile} unchanged)`);
+    }
+  } else {
+    mkdirSync(dirname(agySettingsFile), { recursive: true });
+    const b = backup(agySettingsFile);
+    if (b) actions.push(`backup: ${b}`);
+    const nextSettings = (rawAgySettings && typeof rawAgySettings === 'object' && !Array.isArray(rawAgySettings))
+      ? rawAgySettings
+      : {};
+    const nextPerms = (nextSettings.permissions && typeof nextSettings.permissions === 'object' && !Array.isArray(nextSettings.permissions))
+      ? { ...nextSettings.permissions }
+      : {};
+    const preserved = Array.isArray(nextPerms.allow)
+      ? nextPerms.allow.filter((r) => !isDshCrewAgyPermissionRule(r))
+      : [];
+    nextPerms.allow = [...preserved, ...permInfo.rules];
+    nextSettings.permissions = nextPerms;
+    writeFileSync(agySettingsFile, JSON.stringify(nextSettings, null, 2) + '\n');
+    actions.push(`permissions: ${permInfo.mode} (${permInfo.rules.length} dsh-crew rules) in ${agySettingsFile}`);
+  }
+
+  return {
+    ok: true,
+    actions,
+    permissions: permInfo,
+    desktopPermissionsText: permInfo.text,
+  };
 }
 
 export function uninstallAgy({ home = homedir() } = {}) {
@@ -344,6 +518,18 @@ export function uninstallAgy({ home = homedir() } = {}) {
     delete cfg.mcpServers['dsh-crew'];
     writeFileSync(mcpFile, JSON.stringify(cfg, null, 2) + '\n');
     actions.push(`mcp: removed dsh-crew from ${mcpFile} (backup kept)`);
+  }
+
+  const agySettingsFile = join(home, '.gemini', 'antigravity-cli', 'settings.json');
+  const agySettings = readJson(agySettingsFile, null);
+  if (agySettings && Array.isArray(agySettings.permissions?.allow)) {
+    const filtered = agySettings.permissions.allow.filter((r) => !isDshCrewAgyPermissionRule(r));
+    if (filtered.length !== agySettings.permissions.allow.length) {
+      backup(agySettingsFile);
+      agySettings.permissions.allow = filtered;
+      writeFileSync(agySettingsFile, JSON.stringify(agySettings, null, 2) + '\n');
+      actions.push(`permissions: removed dsh-crew rules from ${agySettingsFile} (backup kept)`);
+    }
   }
 
   for (const f of ['ds-flash.md', 'ds-pro.md']) {

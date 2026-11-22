@@ -11,13 +11,20 @@ import { readInheritedOrigin, extendOrigin, DEFAULT_ORIGIN_DEPTH_LIMIT } from '.
 import { acquireCwdLock, releaseCwdLockByJobId, updateCwdLockHolder, getCwdLocks, CwdLockError } from './cwd-lock.mjs';
 import { resolveWorkerCwd } from './paths.mjs';
 import { detectOrchestrator } from './process-info.mjs';
+import { PERMISSIONS, resolveWorkerPermission, resolveEffectivePreset, readMaxPermission } from './permission-policy.mjs';
+import { appendSummaryContract } from './summary-parser.mjs';
+import { offloadWorkerResult } from './result-offload.mjs';
 
 const server = new McpServer({ name: 'dsh-crew', version: '0.1.0-rc.15' });
 
 const tierSchema = z.enum(['flash', 'pro']).optional().describe('Worker model tier. flash = mechanical, well-scoped work (single-file edits, lookups, formatting); pro = multi-file changes, debugging, design judgment. Omit to use the session default. Ignored when worker= is set.');
 const effortSchema = z.enum(['off', 'high', 'max']).optional().describe('Reasoning effort for the worker. Omit to use the session default. With worker= it only applies when passed explicitly and the profile supports it (agy maps to low/medium/high).');
 const workerSchema = z.string().optional().describe('Named CLI worker profile (e.g. "agy" or "grok"). Explicit opt-in only: set it when the user explicitly asks for that external coding CLI, never as a default. When set, dispatch bypasses tier/mode and runs the task through that CLI; the profile pins backend×model×effort. See dsh_worker_config output, worker_profiles field, for the available profiles.');
-const allowConcurrentCwdSchema = z.boolean().optional().describe('Allow this dispatch even though another running worker already holds the same cwd (workspace) lock. Default false: concurrent writers corrupt a shared repo, so the second dispatch is refused with the holder info instead of queueing. Set true only for read-only tasks.');
+const allowConcurrentCwdSchema = z.boolean().optional().describe('Allow this dispatch even though another running worker already holds the same cwd (workspace) lock. Default false: concurrent writers corrupt a shared repo, so the second dispatch is refused with the holder info instead of queueing. Set true only for read-only tasks (defaults permission to "read-only" and rejects non-read-only permissions).');
+const permissionSchema = z.enum(PERMISSIONS).optional().describe('Per-task DSH sandbox permission: "read-only" (no writes, skips Windows ACL grants; default when allow_concurrent_cwd=true), "workspace-write" (default when allow_concurrent_cwd=false; read/write inside cwd), "auto" (workspace-write with temporary git worktree fallback on Windows ACL failure), "full-access" (explicit opt-in only -> danger-full-access).');
+const presetSchema = z.string().optional().describe('Optional hub-mode agent preset id for this task (overrides session preset_flash / preset_pro).');
+const inlineLimitSchema = z.number().int().positive().optional().describe('Override the inline output-token threshold (default 1500 tokens; char threshold scales proportionally as round(inline_limit * 4000 / 1500), default 4000 chars). Outputs exceeding the threshold are offloaded to report_path with only summary + stats returned unless full_reply=true.');
+const fullReplySchema = z.boolean().optional().describe('When true, keep the full result text inline even when offloaded to report_path or when the job failed.');
 
 // Session-level configuration. This MCP server process lives exactly as long
 // as one Claude Code / Codex session, so plain memory IS session scope.
@@ -36,6 +43,7 @@ const sessionConfig = {
   escalate_on_failure: globalDefaults.escalate_on_failure,
   preset_flash: globalDefaults.preset_flash ?? 'default',
   preset_pro: globalDefaults.preset_pro ?? 'default',
+  report_dir: globalDefaults.report_dir ?? '',
   // Tier -> LLM route. A provider id names a route the HOST already has
   // configured; blank means the tier's built-in DeepSeek default (#10).
   flash_provider: globalDefaults.flash_provider ?? '',
@@ -51,9 +59,8 @@ function bindingForTier(tier) {
   return resolveTierBinding(tier, sessionConfig);
 }
 
-function presetForTier(tier) {
-  const p = tier === 'flash' ? sessionConfig.preset_flash : sessionConfig.preset_pro;
-  return !p || p === 'default' ? undefined : p;
+function presetForTier(tier, explicitPreset) {
+  return resolveEffectivePreset({ preset: explicitPreset, tier, config: sessionConfig });
 }
 
 /** Tool-layer tier enforcement: the policy overrides whatever was requested. */
@@ -65,6 +72,34 @@ function applyTierPolicy(tier) {
 
 function text(obj) {
   return { content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] };
+}
+
+function prepareCliDispatch({ worker, task, permission, allowConcurrentCwd }) {
+  if (permission !== undefined) {
+    throw new Error(`worker=${JSON.stringify(worker)} CLI profile cannot enforce DSH sandbox permission=${JSON.stringify(permission)}; omit permission or omit worker=`);
+  }
+  return appendSummaryContract(task, { permission: allowConcurrentCwd ? 'read-only' : 'workspace-write' });
+}
+
+const settledReportTimestamps = new Map();
+
+function finalizeWorkerResult(view, { inline_limit, full_reply } = {}) {
+  if (!view || typeof view !== 'object' || view.status === 'running' || !view.id) return view;
+  const dirKey = `${view.id}\0${sessionConfig.report_dir}`;
+  let now = settledReportTimestamps.get(dirKey);
+  if (!now) {
+    if (settledReportTimestamps.size >= 500) {
+      settledReportTimestamps.delete(settledReportTimestamps.keys().next().value);
+    }
+    now = new Date();
+    settledReportTimestamps.set(dirKey, now);
+  }
+  return offloadWorkerResult(view, {
+    inlineLimit: inline_limit,
+    fullReply: full_reply,
+    reportDir: sessionConfig.report_dir,
+    now,
+  });
 }
 
 // Which orchestrator spawned this MCP server — stamped on every job so the
@@ -85,6 +120,7 @@ const depthLimitNow = () => sessionConfig.origin_depth_limit ?? DEFAULT_ORIGIN_D
 // hub view this session returns (the hub itself ignores the extra spawn
 // fields until the hub side adopts them).
 const hubOrigins = new Map();
+const hubDispatchMeta = new Map();
 
 function attachOrigin(view, jobId) {
   if (!view || typeof view !== 'object') return view;
@@ -92,6 +128,13 @@ function attachOrigin(view, jobId) {
   if (o && view.origin_depth === undefined) {
     view.origin_depth = o.depth;
     view.origin_chain = o.chain;
+  }
+  const m = hubDispatchMeta.get(jobId);
+  if (m) {
+    if (view.permission === undefined) view.permission = m.permission;
+    if (view.effective_sandbox_mode === undefined) view.effective_sandbox_mode = m.effective_sandbox_mode;
+    if (view.preset === undefined) view.preset = m.preset;
+    if (m.permission_warning && view.permission_warning === undefined) view.permission_warning = m.permission_warning;
   }
   return view;
 }
@@ -138,7 +181,7 @@ async function resolveMode() {
 
 server.registerTool('dsh_run_worker', {
   title: 'Run DSH worker (blocking)',
-  description: 'Run one DSH (DeepSeek Harness) coding agent task and block until it finishes. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks.',
+  description: 'Run one DSH (DeepSeek Harness) coding agent task and block until it finishes. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends a fixed summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED) and parses { summary, summary_missing } from the final output. Outputs exceeding inline_limit (default 1500 output tokens / 4000 chars) or non-done jobs are offloaded to report_path (default <cwd>/.dsh-reports/ with .gitignore updated, or ~/.config/dsh-crew/reports fallback when unwritable) and omit the full result unless full_reply=true. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks.',
   inputSchema: {
     task: z.string().describe('Full task description for the worker, self-contained'),
     tier: tierSchema,
@@ -147,8 +190,12 @@ server.registerTool('dsh_run_worker', {
     cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
     timeout_seconds: z.number().int().positive().max(7200).optional(),
     allow_concurrent_cwd: allowConcurrentCwdSchema,
+    permission: permissionSchema,
+    preset: presetSchema,
+    inline_limit: inlineLimitSchema,
+    full_reply: fullReplySchema,
   },
-}, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd }) => {
+}, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd, permission, preset, inline_limit, full_reply }) => {
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const e = effort ?? sessionConfig.default_effort;
@@ -160,11 +207,12 @@ server.registerTool('dsh_run_worker', {
   // profile pins backend×model×effort). Calls without worker= are untouched.
   if (worker) {
     const profile = resolveProfile(worker); // throws listing the available profile names
+    const cliTask = prepareCliDispatch({ worker, task, permission, allowConcurrentCwd: !!allow_concurrent_cwd });
     const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: profile.backend, cwd: workDir, source: ORCHESTRATOR, depthLimit });
     if (!origin.ok) return originRefusal(origin);
     let job;
     try {
-      job = await startCliJob({ worker, task, cwd: workDir, timeoutMs: timeout * 1000, source: ORCHESTRATOR, effort, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd });
+      job = await startCliJob({ worker, task: cliTask, cwd: workDir, timeoutMs: timeout * 1000, source: ORCHESTRATOR, effort, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd });
     } catch (err) {
       if (err instanceof CwdLockError) return text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder });
       throw err;
@@ -172,10 +220,14 @@ server.registerTool('dsh_run_worker', {
     await waitJob(job.id, timeout * 1000);
     const view = jobView(job, { withResult: true });
     if (view.status === 'running') return text({ ...view, note: `still running after ${timeout}s; poll with dsh_worker_result` });
-    return text(view);
+    return text(finalizeWorkerResult(view, { inline_limit, full_reply }));
   }
 
+  const perm = resolveWorkerPermission({ permission, allowConcurrentCwd: !!allow_concurrent_cwd });
+  const taskWithContract = appendSummaryContract(task, { permission: perm.permission });
+
   const runOnce = async (t) => {
+    const effectivePreset = presetForTier(t, preset);
     if ((await resolveMode()) === 'hub') {
       const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: 'hub', cwd: workDir, source: ORCHESTRATOR, depthLimit });
       if (!origin.ok) return { refusal: originRefusal(origin) };
@@ -188,9 +240,10 @@ server.registerTool('dsh_run_worker', {
       }
       let spawned;
       try {
-        spawned = await hub.spawn({ task, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: presetForTier(t), ...bindingForTier(t), origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
+        spawned = await hub.spawn({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: effectivePreset, permission: perm.permission, allow_concurrent_cwd: !!allow_concurrent_cwd, maxPermission: perm.childMaxPermission, ...bindingForTier(t), origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
         updateCwdLockHolder({ cwd: workDir, jobId: spawned.id });
         hubOrigins.set(spawned.id, origin.origin);
+        hubDispatchMeta.set(spawned.id, { permission: perm.permission, effective_sandbox_mode: perm.effective_sandbox_mode, preset: effectivePreset, ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}) });
       } catch (err) {
         lock.release();
         throw err;
@@ -207,7 +260,7 @@ server.registerTool('dsh_run_worker', {
     if (!origin.ok) return { refusal: originRefusal(origin) };
     let job;
     try {
-      job = await startJob({ task, tier: t, effort: e, cwd: workDir, timeoutMs: timeout * 1000, source: ORCHESTRATOR, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd, ...bindingForTier(t) });
+      job = await startJob({ task: taskWithContract, tier: t, effort: e, cwd: workDir, timeoutMs: timeout * 1000, source: ORCHESTRATOR, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd, permission: perm.permission, maxPermission: perm.childMaxPermission, preset: effectivePreset, ...bindingForTier(t) });
     } catch (err) {
       if (err instanceof CwdLockError) return { refusal: text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder }) };
       throw err;
@@ -231,9 +284,9 @@ server.registerTool('dsh_run_worker', {
     if (res.refusal) return res.refusal;
     job = res.view;
     if (job.status === 'running') return text({ ...job, escalated: true, note: `escalated to pro, still running after ${timeout}s; poll with dsh_worker_result` });
-    return text({ ...job, escalated: true, flash_failure: String(firstError).slice(0, 200) });
+    return text(finalizeWorkerResult({ ...job, escalated: true, flash_failure: String(firstError).slice(0, 200) }, { inline_limit, full_reply }));
   }
-  return text(job);
+  return text(finalizeWorkerResult(job, { inline_limit, full_reply }));
 });
 
 server.registerTool('dsh_worker_probe', {
@@ -248,7 +301,7 @@ server.registerTool('dsh_worker_probe', {
 
 server.registerTool('dsh_worker_config', {
   title: 'Session worker configuration',
-  description: 'Read or update session-level worker settings: enable/disable dispatch, default tier/effort/timeout, execution mode (auto = prefer hub, hub = require the DSH hub, standalone = never use it), tier policy, failure escalation, and which LLM route each tier dispatches to. Call with no arguments to read. To run workers on a local model (Ollama and the like), configure that provider ONCE in DSH and then name it here with flash_provider/flash_model or pro_provider/pro_model — this plugin never defines providers of its own. available_providers lists what the host has configured (hub mode only); bindings shows what each tier currently resolves to. The output includes worker_profiles — the external-CLI backends (agy, grok) usable via the worker= parameter of dsh_run_worker / dsh_spawn_worker — and origin, the inherited worker→worker dispatch chain with its depth limit. Session-only.',
+  description: 'Read or update session-level worker settings: enable/disable dispatch, default tier/effort/timeout, execution mode (auto = prefer hub, hub = require the DSH hub, standalone = never use it), tier policy, failure escalation, preset_flash/preset_pro, report_dir (directory for offloaded worker reports; empty string restores <cwd>/.dsh-reports), and which LLM route each tier dispatches to. Call with no arguments to read. To run workers on a local model (Ollama and the like), configure that provider ONCE in DSH and then name it here with flash_provider/flash_model or pro_provider/pro_model — this plugin never defines providers of its own. available_providers lists what the host has configured (hub mode only); bindings shows what each tier currently resolves to. The output includes worker_profiles — the external-CLI backends (agy, grok) usable via the worker= parameter of dsh_run_worker / dsh_spawn_worker — max_permission ceiling, and origin, the inherited worker→worker dispatch chain with its depth limit. Session-only.',
   inputSchema: {
     enabled: z.boolean().optional().describe('false = refuse all worker dispatch this session'),
     default_tier: z.enum(['flash', 'pro']).optional(),
@@ -259,6 +312,7 @@ server.registerTool('dsh_worker_config', {
     escalate_on_failure: z.boolean().optional().describe('retry a failed blocking flash run once on pro'),
     preset_flash: z.string().optional().describe('hub-mode agent preset for flash workers (preset id, or "default")'),
     preset_pro: z.string().optional().describe('hub-mode agent preset for pro workers (preset id, or "default")'),
+    report_dir: z.string().optional().describe('Directory for offloaded worker reports (relative paths resolve against worker cwd; empty string "" restores default <cwd>/.dsh-reports).'),
     flash_provider: z.string().optional().describe('LLM provider route the flash tier dispatches to. Must be a provider DSH already has configured — see available_providers in this tool\'s output. Empty string restores the built-in DeepSeek default. Configure the provider itself in DSH, not here.'),
     flash_model: z.string().optional().describe('Model id for the flash tier, as that provider names it (e.g. a local Ollama model). Empty string restores the default.'),
     pro_provider: z.string().optional().describe('LLM provider route the pro tier dispatches to. Same rules as flash_provider.'),
@@ -299,13 +353,14 @@ server.registerTool('dsh_worker_config', {
       ? { route_caveat: 'Appearing in available_providers only means an adapter is registered, NOT that it can run a worker. Measured: a route registered purely to re-route another provider fails a dispatch with "registration.adapter.prepareCall is not a function". Nor does DSH report tool-calling support anywhere, and a worker that cannot call tools returns prose and touches no files. A tier bound to a custom route is therefore UNVERIFIED until you call dsh_worker_probe for the configured route; the probe observes one request and is not a permanent capability guarantee.' }
       : {}),
     worker_profiles: listProfiles(),
+    max_permission: readMaxPermission() ?? null,
     origin: { chain: INHERITED_ORIGIN.chain, depth: INHERITED_ORIGIN.depth, depth_limit: depthLimitNow() },
   });
 });
 
 server.registerTool('dsh_spawn_worker', {
   title: 'Spawn DSH worker (async)',
-  description: 'Start a DSH (DeepSeek Harness) coding agent in the background and return immediately with a job id — use it to fan out several workers in parallel. The spawn response carries claims, not results: always fetch each job\'s final result later with dsh_worker_result. Same tier guidance as dsh_run_worker: flash for mechanical, well-scoped work, pro for multi-file changes and debugging. The task string must be self-contained (absolute paths, acceptance criteria, constraints) — the worker sees nothing of your conversation. worker="agy" or "grok" only when the user explicitly asks for that CLI, never a default. Guardrails refuse (never queue) origin-chain recursion and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only fan-out.',
+  description: 'Start a DSH (DeepSeek Harness) coding agent in the background and return immediately with a job id — use it to fan out several workers in parallel. The spawn response carries claims, not results: always fetch each job\'s final result later with dsh_worker_result (which parses { summary, summary_missing } and offloads large or failed outputs to report_path unless full_reply=true). Same tier guidance as dsh_run_worker: flash for mechanical, well-scoped work, pro for multi-file changes and debugging. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends the summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED). The task string must be self-contained (absolute paths, acceptance criteria, constraints) — the worker sees nothing of your conversation. worker="agy" or "grok" only when the user explicitly asks for that CLI, never a default. Guardrails refuse (never queue) origin-chain recursion and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only fan-out.',
   inputSchema: {
     task: z.string().describe('Full task description for the worker, self-contained — the worker has no conversation context, so include absolute paths, acceptance criteria and constraints'),
     tier: tierSchema,
@@ -313,26 +368,32 @@ server.registerTool('dsh_spawn_worker', {
     worker: workerSchema,
     cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
     allow_concurrent_cwd: allowConcurrentCwdSchema,
+    permission: permissionSchema,
+    preset: presetSchema,
   },
-}, async ({ task, tier, effort, worker, cwd, allow_concurrent_cwd }) => {
+}, async ({ task, tier, effort, worker, cwd, allow_concurrent_cwd, permission, preset }) => {
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const depthLimit = depthLimitNow();
   if (worker) {
     // CLI profile dispatch; no hub/standalone involvement, no tier policy.
     const profile = resolveProfile(worker);
+    const cliTask = prepareCliDispatch({ worker, task, permission, allowConcurrentCwd: !!allow_concurrent_cwd });
     const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: profile.backend, cwd: workDir, source: ORCHESTRATOR, depthLimit });
     if (!origin.ok) return originRefusal(origin);
     try {
-      const job = await startCliJob({ worker, task, cwd: workDir, source: ORCHESTRATOR, effort, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd });
+      const job = await startCliJob({ worker, task: cliTask, cwd: workDir, source: ORCHESTRATOR, effort, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd });
       return text(jobView(job));
     } catch (err) {
       if (err instanceof CwdLockError) return text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder });
       throw err;
     }
   }
+  const perm = resolveWorkerPermission({ permission, allowConcurrentCwd: !!allow_concurrent_cwd });
+  const taskWithContract = appendSummaryContract(task, { permission: perm.permission });
   const t = applyTierPolicy(tier);
   const e = effort ?? sessionConfig.default_effort;
+  const effectivePreset = presetForTier(t, preset);
   if ((await resolveMode()) === 'hub') {
     const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: 'hub', cwd: workDir, source: ORCHESTRATOR, depthLimit });
     if (!origin.ok) return originRefusal(origin);
@@ -345,9 +406,10 @@ server.registerTool('dsh_spawn_worker', {
     }
     let spawned;
     try {
-      spawned = await hub.spawn({ task, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: presetForTier(t), ...bindingForTier(t), origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
+      spawned = await hub.spawn({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: effectivePreset, permission: perm.permission, allow_concurrent_cwd: !!allow_concurrent_cwd, maxPermission: perm.childMaxPermission, ...bindingForTier(t), origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
       updateCwdLockHolder({ cwd: workDir, jobId: spawned.id });
       hubOrigins.set(spawned.id, origin.origin);
+      hubDispatchMeta.set(spawned.id, { permission: perm.permission, effective_sandbox_mode: perm.effective_sandbox_mode, preset: effectivePreset, ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}) });
     } catch (err) {
       lock.release();
       throw err;
@@ -358,7 +420,7 @@ server.registerTool('dsh_spawn_worker', {
   const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: 'standalone', cwd: workDir, source: ORCHESTRATOR, depthLimit });
   if (!origin.ok) return originRefusal(origin);
   try {
-    const job = await startJob({ task, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd, ...bindingForTier(t) });
+    const job = await startJob({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, origin: origin.origin, allowConcurrentCwd: !!allow_concurrent_cwd, permission: perm.permission, maxPermission: perm.childMaxPermission, preset: effectivePreset, ...bindingForTier(t) });
     return text(jobView(job));
   } catch (err) {
     if (err instanceof CwdLockError) return text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder });
@@ -399,24 +461,31 @@ server.registerTool('dsh_worker_status', {
 
 server.registerTool('dsh_worker_result', {
   title: 'DSH worker result',
-  description: 'Fetch the final result of a worker job, optionally waiting up to wait_seconds. Always call this for spawned jobs: the dsh_spawn_worker response returns only the job id and status claims, never the result. If a result seems missing or stale (for example after a hub restart orphaned the job), verify against the working tree and dsh_worker_status instead of trusting the summary.',
+  description: 'Fetch the final result of a worker job, optionally waiting up to wait_seconds. Always call this for spawned jobs: the dsh_spawn_worker response returns only the job id and status claims, never the result. Settled jobs return parsed { summary, summary_missing } from the leading summary block; outputs exceeding inline_limit (default 1500 output tokens / 4000 chars) or non-done jobs are written to report_path (default <cwd>/.dsh-reports/ with .gitignore updated, or ~/.config/dsh-crew/reports fallback when unwritable) and omit full result unless full_reply=true. If a result seems missing or stale (for example after a hub restart orphaned the job), verify against the working tree and dsh_worker_status instead of trusting the summary.',
   inputSchema: {
     job_id: z.string(),
     wait_seconds: z.number().int().min(0).max(7200).default(0).describe('0 = return current state immediately'),
+    inline_limit: inlineLimitSchema,
+    full_reply: fullReplySchema,
   },
-}, async ({ job_id, wait_seconds }) => {
+}, async ({ job_id, wait_seconds, inline_limit, full_reply }) => {
   if (job_id.startsWith('hub-')) {
     if (!(await hubAvailable())) return text({ error: 'hub not reachable' });
     const view = await hub.get(job_id, wait_seconds).catch((e) => ({ error: e.message }));
     if (view && view.id) {
       attachOrigin(view, view.id);
-      if (view.status !== 'running') releaseCwdLockByJobId(job_id);
+      if (view.status !== 'running') {
+        releaseCwdLockByJobId(job_id);
+        return text(finalizeWorkerResult(view, { inline_limit, full_reply }));
+      }
     }
     return text(view);
   }
   if (!getJob(job_id)) return text({ error: `no such job: ${job_id}` });
   const job = await waitJob(job_id, wait_seconds > 0 ? wait_seconds * 1000 : 1);
-  return text(jobView(job, { withResult: true }));
+  const view = jobView(job, { withResult: true });
+  if (view.status === 'running') return text(view);
+  return text(finalizeWorkerResult(view, { inline_limit, full_reply }));
 });
 
 server.registerTool('dsh_worker_cancel', {

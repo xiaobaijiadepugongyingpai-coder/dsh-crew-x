@@ -19,6 +19,12 @@ import {
   extractWebServerUrl,
   extractRequestLoopbackUrl,
 } from '../hub-discovery.mjs';
+import {
+  resolveWorkerPermission,
+  resolveEffectivePreset,
+  detectWindowsAclFailure,
+  createTempWorktree,
+} from '../permission-policy.mjs';
 
 // No @deepseek-ai imports here on purpose: this plugin is loaded into the
 // profile realm, and importing our own package copies would create duplicate
@@ -116,6 +122,13 @@ export class WorkerRegistry {
       effort: job.effort, status: job.status, source: job.source, task: clipTask(job.task),
       cwd: job.cwd, turn: job.turn, step: job.step, currentTool: job.currentTool,
       toolCalls: job.toolCalls, tokens: job.tokens, mode: 'hub',
+      permission: job.permission ?? null,
+      effective_sandbox_mode: job.effective_sandbox_mode ?? null,
+      preset: job.preset ?? null,
+      ...(job.permission_warning ? { permission_warning: job.permission_warning } : {}),
+      ...(job.worktree_path ? { worktree_path: job.worktree_path } : {}),
+      ...(job.isolation ? { isolation: job.isolation } : {}),
+      ...(job.degraded_from ? { degraded_from: job.degraded_from } : {}),
       startedAt: job.startedAt, endedAt: job.endedAt,
       ...(job.questions === undefined ? {} : { questions: job.questions }),
     };
@@ -130,15 +143,37 @@ export class WorkerRegistry {
     this.shard.publish([...this.jobs.values()].map((j) => this.view(j)));
   }
 
-  async spawn({ task, tier = 'flash', effort = 'max', cwd, source = 'api', provider, model, preset }) {
+  async spawn({
+    task,
+    tier = 'flash',
+    effort = 'max',
+    cwd,
+    source = 'api',
+    provider,
+    model,
+    preset,
+    permission,
+    allowConcurrentCwd,
+    allow_concurrent_cwd,
+    maxPermission,
+    max_permission,
+    createWorktree,
+  }) {
     if (!TIERS.includes(tier)) throw new Error(`unknown tier "${tier}"`);
     // An explicit {provider, model} from the caller wins (the MCP process owns
     // session-level overrides, exactly as it does for presets); otherwise the
     // hub's own stored config decides, and failing that the tier default.
-    const bound = resolveTierBinding(tier, this.getConfig?.() ?? {});
+    const cfg = this.getConfig?.() ?? {};
+    const bound = resolveTierBinding(tier, cfg);
     const resolvedProvider = typeof provider === 'string' && provider.trim() !== '' ? provider.trim() : bound.provider;
     const resolvedModel = typeof model === 'string' && model.trim() !== '' ? model.trim() : bound.model;
     if (!['off', 'high', 'max'].includes(effort)) throw new Error(`unknown effort "${effort}"`);
+    // Validate permission & ceiling before touching cwd, loader, or sessions.
+    const perm = resolveWorkerPermission({
+      permission,
+      allowConcurrentCwd: Boolean(allowConcurrentCwd ?? allow_concurrent_cwd),
+      maxPermission: maxPermission ?? max_permission,
+    });
     // Accept POSIX, Windows drive (D:\x, C:/x) and UNC (\\srv\share) roots.
     if (!isAbsoluteCwd(cwd)) throw new Error('cwd must be an absolute path');
     // One canonical form for the job, the advisory lock and the workspace
@@ -148,8 +183,21 @@ export class WorkerRegistry {
 
     const id = `hub-${this.nextId++}-${Date.now().toString(36)}`;
     const sessionId = `session-${randomUUID()}`;
+    const selection = { provider: resolvedProvider, model: resolvedModel, reasoningEffort: effort };
+    const presets = this.ctx.get('agentPresets');
+    const wanted = resolveEffectivePreset({ preset, tier, config: cfg });
+    const presetId = presets === undefined
+      ? undefined
+      : (await presets.resolve(!wanted || wanted === 'default' ? undefined : wanted)).id;
+    const effectivePreset = presetId ?? wanted;
+
     const job = {
       id, sessionId, tier, model: resolvedModel, provider: resolvedProvider, effort, task, source, cwd: cwdPath,
+      permission: perm.permission,
+      effective_sandbox_mode: perm.effective_sandbox_mode,
+      preset: effectivePreset,
+      ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}),
+      worktree_path: null, isolation: null, degraded_from: null,
       status: 'running', turn: 0, step: 0, currentTool: null, toolCalls: 0,
       tokens: { input: 0, output: 0, reasoning: 0 },
       startedAt: new Date().toISOString(), endedAt: null,
@@ -158,87 +206,160 @@ export class WorkerRegistry {
     };
     this.jobs.set(id, job);
 
-    const selection = { provider: resolvedProvider, model: resolvedModel, reasoningEffort: effort };
-    const presets = this.ctx.get('agentPresets');
-    const cfg = this.getConfig?.() ?? {};
-    const wanted = preset ?? (tier === 'flash' ? cfg.preset_flash : cfg.preset_pro);
-    const presetId = presets === undefined
-      ? undefined
-      : (await presets.resolve(!wanted || wanted === 'default' ? undefined : wanted)).id;
+    const runAttempt = async (attemptCwd, attemptSessionId, allowAutoDegrade) => {
+      let attemptActive = true;
+      let aclDetected = false;
+      let handle = null;
 
-    const onEvent = (session, event) => {
-      switch (event.type) {
-        case 'step/start':
-          job.turn = event.data?.turn ?? job.turn;
-          job.step = event.data?.step ?? job.step;
-          break;
-        case 'tool/call': job.currentTool = event.data?.name ?? null; job.toolCalls += 1; break;
-        case 'tool/result': job.currentTool = null; break;
-        case 'assistant/message': {
-          const u = event.data?.usage;
-          if (u) {
-            job.tokens.input += u.inputTokens ?? 0;
-            job.tokens.output += u.outputTokens ?? 0;
-            job.tokens.reasoning += u.reasoningTokens ?? 0;
+      const onEvent = (session, event) => {
+        if (!attemptActive) return;
+        switch (event?.type) {
+          case 'step/start':
+            job.turn = event.data?.turn ?? job.turn;
+            job.step = event.data?.step ?? job.step;
+            break;
+          case 'tool/call': job.currentTool = event.data?.name ?? null; job.toolCalls += 1; break;
+          case 'tool/result':
+            if (detectWindowsAclFailure(event)) aclDetected = true;
+            job.currentTool = null;
+            break;
+          case 'assistant/message': {
+            const u = event.data?.usage;
+            if (u) {
+              job.tokens.input += u.inputTokens ?? 0;
+              job.tokens.output += u.outputTokens ?? 0;
+              job.tokens.reasoning += u.reasoningTokens ?? 0;
+            }
+            const text = (event.data?.message?.content ?? [])
+              .filter((c) => c?.type === 'text').map((c) => c.text).join('');
+            if (text) job.texts.push(text);
+            break;
           }
-          const text = (event.data?.message?.content ?? [])
-            .filter((c) => c?.type === 'text').map((c) => c.text).join('');
-          if (text) job.texts.push(text);
-          break;
+          case 'turn/end':
+            if (detectWindowsAclFailure(event.data?.reason)) aclDetected = true;
+            job.stopReason = event.data?.reason?.kind ?? null;
+            job.reasonDetail = event.data?.reason;
+            break;
         }
-        case 'turn/end':
-          job.stopReason = event.data?.reason?.kind ?? null;
-          job.reasonDetail = event.data?.reason;
-          break;
+        this.publish();
+      };
+
+      try {
+        handle = await this.ctx.agents.create({
+          sessionId: attemptSessionId,
+          meta: { cwd: attemptCwd, ...(presetId === undefined ? {} : { agentPreset: presetId }) },
+          agentOptions: {
+            provider: selection.provider,
+            model: selection.model,
+            ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+          },
+          setup: async (agentCtx) => {
+            installModelSelection(agentCtx, { current: selection, assembled: undefined });
+            if (presets !== undefined) await presets.mount(agentCtx, presetId);
+            // Nobody attends a worker session, so a question would wait forever
+            // (#13). Claim this agent's requests ahead of the Web answerer.
+            installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
+            agentCtx.on('session/event', onEvent);
+            agentCtx.on('agent/error', (payload) => {
+              if (!attemptActive) return;
+              const err = payload?.error;
+              if (detectWindowsAclFailure(err)) aclDetected = true;
+              if (job.status !== 'needs_input') job.error = err?.message ?? String(err);
+            });
+          },
+        });
+        job.handle = handle;
+        if (job.status === 'needs_input' || job.status === 'cancelled') {
+          await handle.dispose();
+          return { aclFailed: false };
+        }
+        try {
+          // Group the worker session under the workspace of its cwd; create the
+          // workspace when none exists yet (resolveByPath is exact-match, so a
+          // job cwd never inherits a parent directory's workspace).
+          const registry = this.ctx.get('workspaceRegistry');
+          if (registry !== undefined) {
+            const ws = (await registry.resolveByPath(attemptCwd)) ?? (await registry.create(attemptCwd));
+            await ws.attachSession(attemptSessionId);
+          }
+        } catch (err) {
+          this.ctx.logger?.warn?.(`dsh-crew: workspace attach failed for ${attemptCwd}: ${err?.message ?? err}`);
+        }
+        await handle.agent.whenIdle();
+        if (typeof handle?.agent?.session?.append !== 'function') {
+          throw new Error('agent session does not support sandbox/mode append');
+        }
+        await handle.agent.session.append('sandbox/mode', { mode: perm.effective_sandbox_mode });
+        handle.agent.followup(userMessage(task));
+        await handle.agent.whenIdle();
+        if (job.status !== 'needs_input' && job.status !== 'cancelled') {
+          job.result = job.texts.at(-1) ?? '';
+          job.status = job.stopReason === 'completed' ? 'done' : 'failed';
+        }
+        if (job.status === 'failed' && !job.error) job.error = `turn ended: ${job.stopReason ?? 'unknown'}`;
+        await this.ctx.sessions.flush(handle.agent.session);
+      } catch (err) {
+        attemptActive = false;
+        if (detectWindowsAclFailure(err)) aclDetected = true;
+        const isAcl = aclDetected || detectWindowsAclFailure([job.error, job.reasonDetail]);
+        try { await handle?.dispose(); } catch {}
+        job.handle = null;
+        if (job.status === 'cancelled') return { aclFailed: false };
+        if (allowAutoDegrade && perm.permission === 'auto' && isAcl) {
+          return { aclFailed: true };
+        }
+        throw err;
       }
-      this.publish();
+
+      attemptActive = false;
+      const isAcl = aclDetected || detectWindowsAclFailure([job.error, job.reasonDetail]);
+      if (job.status !== 'cancelled' && job.status !== 'needs_input' && allowAutoDegrade && perm.permission === 'auto' && isAcl) {
+        try { await handle?.dispose(); } catch {}
+        job.handle = null;
+        return { aclFailed: true };
+      }
+      return { aclFailed: false };
     };
 
     const run = async () => {
-      const handle = await this.ctx.agents.create({
-        sessionId,
-        meta: { cwd: cwdPath, ...(presetId === undefined ? {} : { agentPreset: presetId }) },
-        agentOptions: {
-          provider: selection.provider,
-          model: selection.model,
-          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-        },
-        setup: async (agentCtx) => {
-          installModelSelection(agentCtx, { current: selection, assembled: undefined });
-          if (presets !== undefined) await presets.mount(agentCtx, presetId);
-          // Nobody attends a worker session, so a question would wait forever
-          // (#13). Claim this agent's requests ahead of the Web answerer.
-          installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
-          agentCtx.on('session/event', onEvent);
-          agentCtx.on('agent/error', (payload) => {
-            const err = payload?.error;
-            if (job.status !== 'needs_input') job.error = err?.message ?? String(err);
-          });
-        },
-      });
-      job.handle = handle;
-      if (job.status === 'needs_input') { await handle.dispose(); return; }
-      try {
-        // Group the worker session under the workspace of its cwd; create the
-        // workspace when none exists yet (resolveByPath is exact-match, so a
-        // job cwd never inherits a parent directory's workspace).
-        const registry = this.ctx.get('workspaceRegistry');
-        if (registry !== undefined) {
-          const ws = (await registry.resolveByPath(cwdPath)) ?? (await registry.create(cwdPath));
-          await ws.attachSession(sessionId);
+      const first = await runAttempt(cwdPath, sessionId, true);
+      if (first.aclFailed && job.status !== 'cancelled') {
+        const firstAclError = job.error;
+        const worktreeFn = createWorktree ?? this.createWorktree ?? createTempWorktree;
+        let wt;
+        try {
+          wt = await worktreeFn({ cwd: cwdPath, jobId: id });
+        } catch (wtErr) {
+          job.status = 'failed';
+          job.error = firstAclError ? `${firstAclError}; ${wtErr?.message ?? wtErr}` : (wtErr?.message ?? String(wtErr));
+          return;
         }
-      } catch (err) {
-        this.ctx.logger?.warn?.(`dsh-crew: workspace attach failed for ${cwdPath}: ${err?.message ?? err}`);
+        if (job.status === 'cancelled') return;
+        const attemptCwd = wt?.cwd ?? wt?.worktreePath;
+        if (!attemptCwd) {
+          job.status = 'failed';
+          job.error = 'auto worktree fallback failed: missing worktree cwd';
+          return;
+        }
+        const retrySessionId = `session-${randomUUID()}`;
+        job.sessionId = retrySessionId;
+        job.worktree_path = wt.worktreePath;
+        job.isolation = 'git-worktree';
+        job.degraded_from = perm.effective_sandbox_mode;
+        job.status = 'running';
+        job.turn = 0;
+        job.step = 0;
+        job.toolCalls = 0;
+        job.tokens = { input: 0, output: 0, reasoning: 0 };
+        job.error = null;
+        job.result = null;
+        job.stopReason = null;
+        job.reasonDetail = undefined;
+        job.currentTool = null;
+        job.texts = [];
+        this.publish();
+        await runAttempt(attemptCwd, retrySessionId, false);
       }
-      await handle.agent.whenIdle();
-      handle.agent.followup(userMessage(task));
-      await handle.agent.whenIdle();
-      if (job.status !== 'needs_input') {
-        job.result = job.texts.at(-1) ?? '';
-        job.status = job.stopReason === 'completed' ? 'done' : 'failed';
-      }
-      if (job.status === 'failed' && !job.error) job.error = `turn ended: ${job.stopReason ?? 'unknown'}`;
-      await this.ctx.sessions.flush(handle.agent.session);
     };
 
     job.promise = run()
@@ -661,7 +782,14 @@ export async function apply(ctx) {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' }, { allow: 'POST' });
         try {
-          const { target, statusline } = await readBody(req);
+          const {
+            target,
+            statusline,
+            agyPermissions,
+            permissions,
+            allowSafePermissions,
+            allowDispatchPermissions,
+          } = await readBody(req);
           // Cache-busted import: the installer must always run the code
           // currently on disk, not whatever this process first loaded —
           // a stale cached copy once re-broke user settings after a fix.
@@ -678,7 +806,14 @@ export async function apply(ctx) {
             });
           }
           if (target === 'codex') return sendJson(res, 200, installCodex({}));
-          if (target === 'agy') return sendJson(res, 200, installAgy({}));
+          if (target === 'agy') {
+            return sendJson(res, 200, installAgy({
+              ...(agyPermissions !== undefined ? { agyPermissions } : {}),
+              ...(permissions !== undefined ? { permissions } : {}),
+              ...(allowSafePermissions !== undefined ? { allowSafePermissions } : {}),
+              ...(allowDispatchPermissions !== undefined ? { allowDispatchPermissions } : {}),
+            }));
+          }
           if (target === 'grok') return sendJson(res, 200, installGrok({}));
           if (target === 'claude-uninstall') return sendJson(res, 200, await uninstallClaudeCode({}));
           if (target === 'codex-uninstall') return sendJson(res, 200, uninstallCodex({}));

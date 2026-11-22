@@ -9,6 +9,12 @@ import { ORIGIN_CHAIN_ENV, ORIGIN_DEPTH_ENV } from './origin-guard.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import {
+  resolveWorkerPermission,
+  resolveEffectivePreset,
+  detectWindowsAclFailure,
+  createTempWorktree,
+} from './permission-policy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_DIR = join(homedir(), '.config', 'dsh-crew');
@@ -54,6 +60,13 @@ export function publishStatus() {
     task: clipTask(j.task), cwd: j.cwd, turn: j.turn, step: j.step, toolCalls: j.toolCalls,
     currentTool: j.currentTool, tokens: j.tokens,
     backend: backendOf(j), profile: profileOf(j), mode: modeOf(j),
+    permission: j.permission ?? null,
+    effective_sandbox_mode: j.effective_sandbox_mode ?? null,
+    preset: j.preset ?? null,
+    ...(j.permission_warning ? { permission_warning: j.permission_warning } : {}),
+    ...(j.worktree_path ? { worktree_path: j.worktree_path } : {}),
+    ...(j.isolation ? { isolation: j.isolation } : {}),
+    ...(j.degraded_from ? { degraded_from: j.degraded_from } : {}),
     liveness: j.liveness ?? null,
     // WPC10: last CLI stream event, so the panel can say how long a stalled
     // job has been quiet (mirrors v.activity.lastEventAt used by the MCP tools).
@@ -75,6 +88,13 @@ export function jobView(j, { withResult = false } = {}) {
     tokens: j.tokens, toolCalls: j.toolCalls,
     backend: backendOf(j), profile: profileOf(j), mode: modeOf(j),
     cwd: j.cwd,
+    permission: j.permission ?? null,
+    effective_sandbox_mode: j.effective_sandbox_mode ?? null,
+    preset: j.preset ?? null,
+    ...(j.permission_warning ? { permission_warning: j.permission_warning } : {}),
+    ...(j.worktree_path ? { worktree_path: j.worktree_path } : {}),
+    ...(j.isolation ? { isolation: j.isolation } : {}),
+    ...(j.degraded_from ? { degraded_from: j.degraded_from } : {}),
     // WPC14: pid (+ pgid when the worker leads its own process group) so the
     // panel can probe and kill the OS process of an orphaned ghost job.
     pid: j.pid ?? null, pgid: j.pgid ?? null,
@@ -106,7 +126,24 @@ export function registerJob(job) {
   return job;
 }
 
-export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxTokens = 49_152, timeoutMs = 1_800_000, source = 'api', origin = null, allowConcurrentCwd = false, provider, model }) {
+export async function startJob({
+  task,
+  tier = 'flash',
+  effort = 'max',
+  cwd,
+  maxTokens = 49_152,
+  timeoutMs = 1_800_000,
+  source = 'api',
+  origin = null,
+  allowConcurrentCwd,
+  allow_concurrent_cwd,
+  provider,
+  model,
+  permission,
+  maxPermission,
+  preset,
+  _deps,
+}) {
   const tierInfo = TIERS[tier];
   if (!tierInfo) throw new Error(`unknown tier "${tier}" (expected: ${Object.keys(TIERS).join(', ')})`);
   // The caller (the MCP server, which owns session-level config) may bind this
@@ -117,6 +154,16 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
   const dispatchModel = typeof model === 'string' && model.trim() !== '' ? model.trim() : tierInfo.model;
   if (!['off', 'high', 'max'].includes(effort)) throw new Error(`unknown effort "${effort}" (expected: off, high, max)`);
 
+  const effectiveAllowConcurrent = Boolean(allowConcurrentCwd ?? allow_concurrent_cwd);
+  const baseEnv = _deps?.env ?? process.env;
+  const perm = resolveWorkerPermission({
+    permission,
+    allowConcurrentCwd: effectiveAllowConcurrent,
+    maxPermission,
+    env: baseEnv,
+  });
+  const effectivePreset = resolveEffectivePreset({ preset, tier });
+
   const workspace = resolve(cwd ?? process.cwd());
   const id = `job-${nextId++}-${Date.now().toString(36)}`;
   const startedAt = new Date().toISOString();
@@ -125,12 +172,17 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
   // SDK import, key check or runtime spawn can happen (and every later
   // failure path releases it — see the catch below and the run finally).
   let releaseLock = null;
-  if (!allowConcurrentCwd) {
+  if (!effectiveAllowConcurrent) {
     releaseLock = acquireCwdLock({ cwd: workspace, jobId: id, backend: 'standalone', mode: 'standalone', startedAt }).release;
   }
 
   const job = {
     id, tier, model: dispatchModel, provider: dispatchProvider, effort, task, source, cwd: workspace,
+    permission: perm.permission,
+    effective_sandbox_mode: perm.effective_sandbox_mode,
+    preset: effectivePreset,
+    ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}),
+    worktree_path: null, isolation: null, degraded_from: null,
     status: 'running', turn: 0, step: 0, currentTool: null, toolCalls: 0,
     tokens: { input: 0, output: 0, reasoning: 0 },
     startedAt, endedAt: null,
@@ -145,100 +197,166 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
     // server keeps every @deepseek-ai/* package external (see scripts/build-mcp.mjs):
     // hub mode never touches the SDK, and an installed copy without the package
     // fails on this line - with a hint - instead of dying at module load.
-    let DeepSeekHarness;
-    try {
-      ({ DeepSeekHarness } = await import('@deepseek-ai/dsh-sdk-client'));
-    } catch (err) {
-      if (err?.code === 'ERR_MODULE_NOT_FOUND') {
-        const hint = new Error(`@deepseek-ai/dsh-sdk-client not installed; standalone dispatch requires it - run pnpm install in ${ROOT}, or use hub mode (dsh_worker_config mode=hub) so jobs run inside a DSH instance`);
-        hint.code = 'ERR_MODULE_NOT_FOUND';
-        throw hint;
+    let DeepSeekHarness = _deps?.DeepSeekHarness;
+    if (!DeepSeekHarness) {
+      try {
+        ({ DeepSeekHarness } = await import('@deepseek-ai/dsh-sdk-client'));
+      } catch (err) {
+        if (err?.code === 'ERR_MODULE_NOT_FOUND') {
+          const hint = new Error(`@deepseek-ai/dsh-sdk-client not installed; standalone dispatch requires it - run pnpm install in ${ROOT}, or use hub mode (dsh_worker_config mode=hub) so jobs run inside a DSH instance`);
+          hint.code = 'ERR_MODULE_NOT_FOUND';
+          throw hint;
+        }
+        throw err;
       }
-      throw err;
+
+      if (!existsSync(RUNTIME_BIN)) throw new Error(`dsh-jsonrpc-agent not installed at ${RUNTIME_BIN}; run pnpm install in ${ROOT}`);
     }
 
-    if (!existsSync(RUNTIME_BIN)) throw new Error(`dsh-jsonrpc-agent not installed at ${RUNTIME_BIN}; run pnpm install in ${ROOT}`);
-    const dotEnv = loadDotEnv();
-    if (!process.env.DEEPSEEK_API_KEY && !dotEnv.DEEPSEEK_API_KEY) {
+    const dotEnv = _deps?.dotEnv ?? loadDotEnv();
+    if (!_deps?.DeepSeekHarness && !baseEnv.DEEPSEEK_API_KEY && !dotEnv.DEEPSEEK_API_KEY) {
       throw new Error(`DEEPSEEK_API_KEY not found in env or ${join(CONFIG_DIR, '.env')}`);
     }
 
-    const harness = new DeepSeekHarness({
+    const createHarnessForCwd = (targetCwd) => new DeepSeekHarness({
       launch: {
         command: RUNTIME_BIN,
         args: [CORDIS],
-        cwd: workspace,
+        cwd: targetCwd,
         env: {
-          ...process.env,
+          ...baseEnv,
           ...dotEnv,
-          DSH_CWD: workspace,
+          DSH_CWD: targetCwd,
           DSH_SESSION_ROOT: join(CONFIG_DIR, 'sessions'),
           DSH_REASONING_EFFORT: effort,
+          DSH_SANDBOX_MODE: perm.effective_sandbox_mode,
+          DSH_CREW_MAX_PERMISSION: perm.childMaxPermission,
           // Origin guard: the worker runtime inherits the dispatch chain, so a
           // crew instance it starts itself continues the chain (WPC9).
           ...(origin ? { [ORIGIN_CHAIN_ENV]: JSON.stringify(origin.chain), [ORIGIN_DEPTH_ENV]: String(origin.depth) } : {}),
         },
         requestTimeoutMs: timeoutMs,
       },
-      cwd: workspace,
+      cwd: targetCwd,
       provider: dispatchProvider,
       model: dispatchModel,
       maxTokens,
     });
-    job.harness = harness;
-    jobs.set(id, job);
 
-    const sessionId = id;
-    const onNotification = (n) => {
-      // WPC14: the standalone runtime process exists once the run has started
-      // (the SDK client spawns it lazily). Capture its pid on the first
-      // notification so views, shard mirrors and ghost tombstones carry it —
-      // and track it while running, since a failed handshake makes the SDK
-      // swap in a fresh client (new subprocess).
-      if (job.status === 'running') {
-        const child = harness.client?.child;
-        if (child?.pid && job.pid !== child.pid) { job.pid = child.pid; publishStatus(); }
-      }
-      if (n.method === 'session.status') return;
-      if (n.method !== 'session.event') return;
-      if (n.params?.sessionId && n.params.sessionId !== sessionId) return;
-      const e = n.params.event;
-      if (!e?.type) return;
-      switch (e.type) {
-        case 'step/start': job.turn = e.data?.turn ?? job.turn; job.step = e.data?.step ?? job.step; break;
-        case 'tool/call': job.currentTool = e.data?.name ?? null; job.toolCalls += 1; break;
-        case 'tool/result': job.currentTool = null; break;
-        case 'assistant/message': {
-          const u = e.data?.usage;
-          if (u) {
-            job.tokens.input += u.inputTokens ?? 0;
-            job.tokens.output += u.outputTokens ?? 0;
-            job.tokens.reasoning += u.reasoningTokens ?? 0;
-          }
-          break;
+    const runAttempt = async (targetCwd, sessionId, allowAutoDegrade) => {
+      const attemptHarness = createHarnessForCwd(targetCwd);
+      job.harness = attemptHarness;
+      let attemptActive = true;
+      let aclDetected = false;
+
+      const onNotification = (n) => {
+        if (!attemptActive) return;
+        // WPC14: the standalone runtime process exists once the run has started
+        // (the SDK client spawns it lazily). Capture its pid on the first
+        // notification so views, shard mirrors and ghost tombstones carry it —
+        // and track it while running, since a failed handshake makes the SDK
+        // swap in a fresh client (new subprocess).
+        if (job.status === 'running') {
+          const child = attemptHarness.client?.child;
+          if (child?.pid && job.pid !== child.pid) { job.pid = child.pid; publishStatus(); }
         }
-        case 'turn/end': job.stopReason = e.data?.reason?.kind ?? null; break;
-      }
-      publishStatus();
-    };
+        if (n.method === 'session.status') return;
+        if (n.method !== 'session.event') return;
+        if (n.params?.sessionId && n.params.sessionId !== sessionId) return;
+        const e = n.params.event;
+        if (!e?.type) return;
+        switch (e.type) {
+          case 'step/start': job.turn = e.data?.turn ?? job.turn; job.step = e.data?.step ?? job.step; break;
+          case 'tool/call': job.currentTool = e.data?.name ?? null; job.toolCalls += 1; break;
+          case 'tool/result':
+            if (detectWindowsAclFailure(e)) aclDetected = true;
+            job.currentTool = null;
+            break;
+          case 'assistant/message': {
+            const u = e.data?.usage;
+            if (u) {
+              job.tokens.input += u.inputTokens ?? 0;
+              job.tokens.output += u.outputTokens ?? 0;
+              job.tokens.reasoning += u.reasoningTokens ?? 0;
+            }
+            break;
+          }
+          case 'turn/end':
+            if (detectWindowsAclFailure(e.data?.reason)) aclDetected = true;
+            job.stopReason = e.data?.reason?.kind ?? null;
+            break;
+        }
+        publishStatus();
+      };
 
-    job.promise = harness
-      .run(task, { sessionId, onNotification })
-      .then((result) => {
+      try {
+        const result = await attemptHarness.run(task, { sessionId, onNotification });
+        attemptActive = false;
+        const aclEvents = (result?.events ?? [])
+          .filter((ev) => ev?.type === 'tool/result' || ev?.type === 'turn/end')
+          .map((ev) => (ev.type === 'turn/end' ? ev.data?.reason : ev));
+        if (detectWindowsAclFailure(aclEvents)) aclDetected = true;
+        if (job.status !== 'cancelled' && allowAutoDegrade && perm.permission === 'auto' && aclDetected) {
+          return { aclFailed: true, detail: null };
+        }
+        if (job.status === 'cancelled') return { aclFailed: false };
         job.result = result.finalResponse ?? '';
         const lastEnd = [...(result.events ?? [])].reverse().find((ev) => ev?.type === 'turn/end');
         job.stopReason = lastEnd?.data?.reason?.kind ?? job.stopReason;
         job.status = job.stopReason === 'completed' ? 'done' : 'failed';
         if (job.status === 'failed' && !job.error) job.error = `turn ended with reason: ${job.stopReason ?? 'unknown'}`;
-      })
+        return { aclFailed: false };
+      } catch (err) {
+        attemptActive = false;
+        if (detectWindowsAclFailure(err)) aclDetected = true;
+        if (job.status !== 'cancelled' && allowAutoDegrade && perm.permission === 'auto' && aclDetected) {
+          return { aclFailed: true, detail: err?.message ?? String(err) };
+        }
+        throw err;
+      } finally {
+        try { await attemptHarness.close(); } catch {}
+      }
+    };
+
+    jobs.set(id, job);
+    job.promise = (async () => {
+      const first = await runAttempt(workspace, id, true);
+      if (first.aclFailed && job.status !== 'cancelled') {
+        const worktreeFn = _deps?.createWorktree ?? createTempWorktree;
+        let wt;
+        try {
+          wt = await worktreeFn({ cwd: workspace, jobId: id });
+        } catch (wtErr) {
+          const prefix = first.detail ? `${first.detail}; ` : '';
+          throw new Error(`${prefix}${wtErr?.message ?? wtErr}`, { cause: wtErr });
+        }
+        if (job.status === 'cancelled') return;
+        const attemptCwd = wt?.cwd ?? wt?.worktreePath;
+        if (!attemptCwd) throw new Error('auto worktree fallback failed: missing worktree cwd');
+        job.worktree_path = wt.worktreePath;
+        job.isolation = 'git-worktree';
+        job.degraded_from = perm.effective_sandbox_mode;
+        job.status = 'running';
+        job.pid = null;
+        job.turn = 0;
+        job.step = 0;
+        job.toolCalls = 0;
+        job.tokens = { input: 0, output: 0, reasoning: 0 };
+        job.error = null;
+        job.result = null;
+        job.stopReason = null;
+        job.currentTool = null;
+        publishStatus();
+        await runAttempt(attemptCwd, `${id}-wt`, false);
+      }
+    })()
       .catch((err) => {
         job.status = job.status === 'cancelled' ? 'cancelled' : 'failed';
         job.error = err?.message ?? String(err);
       })
-      .finally(async () => {
+      .finally(() => {
         job.endedAt = new Date().toISOString();
         job.currentTool = null;
-        try { await harness.close(); } catch {}
         // Release the cwd lock on EVERY terminal path: done, failed,
         // cancelled, request-timeout (harness rejects) all land here.
         job._releaseCwdLock?.();
@@ -283,7 +401,7 @@ export async function cancelJob(id) {
   if (job.status !== 'running') return job;
   job.status = 'cancelled';
   job.error = 'cancelled by request';
-  try { await job.harness.close(); } catch {}
+  try { await job.harness?.close(); } catch {}
   publishStatus();
   return job;
 }

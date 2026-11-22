@@ -7,6 +7,12 @@ import { createPortal } from 'react-dom';
 
 import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes } from './jobs-view';
 import {
+  AGY_ALL_PERMISSION_RULES,
+  AGY_SAFE_PERMISSION_RULES,
+  agyDesktopPermissionsText,
+  agyInitialPermissionSelection,
+} from './agy-permissions-view';
+import {
   formatProbeOutcome,
   modelSelectOptions,
   patchForModelChange,
@@ -199,9 +205,9 @@ const COPY = {
         restore: '删除 ~/.codex/ 下的 ds-flash / ds-pro 角色与 dsh 命令文件（角色文件先备份）',
       },
       agy: {
-        install: '把 dsh-crew MCP server 注册进 ~/.gemini/config/mcp_config.json，并将 ds-flash / ds-pro 代理与 dsh-config / dsh-status skills 复制到 ~/.gemini/config/agents 与 skills（修改前自动备份）',
-        update: '重新覆盖 MCP 配置、代理与 skills（插件路径或配置变更后用）；原文件先备份',
-        restore: '从 ~/.gemini/config 移除 dsh-crew 的 mcp_config.json 条目、ds-flash / ds-pro 代理与 dsh-config / dsh-status skills（修改前备份）',
+        install: '把 dsh-crew MCP server 注册进 ~/.gemini/config/mcp_config.json，复制 ds-flash / ds-pro 代理与 skills，并按下方勾选写入 ~/.gemini/antigravity-cli/settings.json 权限白名单（修改前自动备份）',
+        update: '重新覆盖 MCP 配置、代理、skills 与所选 CLI 权限白名单（取消勾选会同步清理对应 dsh-crew 规则）；原文件先备份',
+        restore: '从 ~/.gemini/config 移除 dsh-crew 的 mcp_config.json 条目、代理、skills，并从 ~/.gemini/antigravity-cli/settings.json 移除 mcp(dsh-crew/...) 规则（修改前备份）',
       },
       grok: {
         install: '把 dsh-crew MCP server 段写入 ~/.grok/config.toml，并将 ds-flash / ds-pro 代理与 dsh-config / dsh-status 命令复制到 ~/.grok/agents 与 commands（修改前自动备份）。提示：grok 出于安全设计，在未信任的项目目录里不会启动仓库级 MCP server —— 全局安装不受影响，但在未信任目录里用 grok mcp doctor 检查时会看到 "folder untrusted"，换个目录或加 --trust 即可。',
@@ -209,6 +215,20 @@ const COPY = {
         restore: '从 ~/.grok 移除 dsh-crew 的 config.toml 段、ds-flash / ds-pro 代理与 dsh-config / dsh-status 命令（修改前备份）',
       },
     },
+    agyPermsTitle: 'Antigravity CLI 权限白名单（~/.gemini/antigravity-cli/settings.json）',
+    agyPermsSafe: '放行低风险查询与配置工具（推荐）',
+    agyPermsSafeDesc: 'dsh_worker_status · dsh_worker_result · dsh_worker_config · dsh_worker_probe',
+    agyPermsDispatch: '放行执行与取消工具（默认保持询问 Ask，需明确勾选）',
+    agyPermsDispatchDesc: 'dsh_run_worker · dsh_spawn_worker · dsh_worker_cancel',
+    agyPermChips: { none: '全部询问 Ask', safe: '仅低风险放行 (4)', dispatch: '仅执行放行 (3)', all: '全部放行 (7)', custom: '自定义' } as Record<string, string>,
+    agyDesktopTitle: 'Antigravity Desktop App UI 规则（Settings > General > Global Permissions）',
+    agyDesktopHint: '桌面端独立读取 Global Permissions；可直接复制下方规则粘贴进去：',
+    agyDesktopEmpty: '当前未勾选自动放行规则（全部工具保持询问 Ask）。可勾选上方推荐项，或使用右侧按钮快捷复制。',
+    copyBtn: '复制规则',
+    copySafeBtn: '复制低风险 (4)',
+    copyAllBtn: '复制全部 (7)',
+    copied: '已复制',
+    copyFailed: '复制失败，请手动全选文本框复制',
   },
   en: {
     label: 'DSH Crew',
@@ -315,9 +335,9 @@ const COPY = {
         restore: 'Delete ds-flash / ds-pro roles and dsh prompts from ~/.codex/ (roles backed up first)',
       },
       agy: {
-        install: 'Register the dsh-crew MCP server in ~/.gemini/config/mcp_config.json and copy ds-flash / ds-pro agents plus dsh-config / dsh-status skills into ~/.gemini/config/agents and skills (backed up first)',
-        update: 'Re-write the MCP entry, agents and skills (after path/config changes); originals backed up',
-        restore: 'Remove the dsh-crew mcp_config.json entry, ds-flash / ds-pro agents and dsh-config / dsh-status skills from ~/.gemini/config (backed up first)',
+        install: 'Register the dsh-crew MCP server in ~/.gemini/config/mcp_config.json, copy ds-flash / ds-pro agents and skills, and write the selected permission allowlist to ~/.gemini/antigravity-cli/settings.json (backed up first)',
+        update: 'Re-write the MCP entry, agents, skills, and selected CLI permission allowlist (unchecking removes matching dsh-crew rules); originals backed up',
+        restore: 'Remove the dsh-crew mcp_config.json entry, agents, skills, and mcp(dsh-crew/...) rules from ~/.gemini/antigravity-cli/settings.json (backed up first)',
       },
       grok: {
         install: 'Write the dsh-crew MCP server section into ~/.grok/config.toml and copy ds-flash / ds-pro agents plus dsh-config / dsh-status commands into ~/.grok/agents and commands (backed up first). Note: by security design grok does not start repo-level MCP servers in untrusted project directories — a global install is unaffected, but grok mcp doctor reports "folder untrusted" in an untrusted directory; change directory or pass --trust.',
@@ -325,6 +345,20 @@ const COPY = {
         restore: 'Remove the dsh-crew config.toml section, ds-flash / ds-pro agents and dsh-config / dsh-status commands from ~/.grok (backed up first)',
       },
     },
+    agyPermsTitle: 'Antigravity CLI permission allowlist (~/.gemini/antigravity-cli/settings.json)',
+    agyPermsSafe: 'Allow low-risk query & config tools (recommended)',
+    agyPermsSafeDesc: 'dsh_worker_status · dsh_worker_result · dsh_worker_config · dsh_worker_probe',
+    agyPermsDispatch: 'Allow dispatch & cancel tools (default Ask — check explicitly)',
+    agyPermsDispatchDesc: 'dsh_run_worker · dsh_spawn_worker · dsh_worker_cancel',
+    agyPermChips: { none: 'all Ask', safe: 'safe only (4)', dispatch: 'dispatch only (3)', all: 'all allowed (7)', custom: 'custom' } as Record<string, string>,
+    agyDesktopTitle: 'Antigravity Desktop App UI rules (Settings > General > Global Permissions)',
+    agyDesktopHint: 'Desktop App reads Global Permissions separately; copy the rules below and paste them there:',
+    agyDesktopEmpty: 'No auto-allow rules selected (all tools stay on Ask). Check an option above or use the quick-copy buttons.',
+    copyBtn: 'Copy rules',
+    copySafeBtn: 'Copy safe (4)',
+    copyAllBtn: 'Copy all (7)',
+    copied: 'Copied',
+    copyFailed: 'Copy failed — select and copy the text box manually',
   },
 };
 
@@ -485,6 +519,11 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   const [testResult, setTestResult] = useState<{ key: string; ok?: boolean; steps?: any[]; error?: string; busy: boolean } | null>(null);
   const [integrationsCollapsed, toggleIntegrations] = useCollapseSection('integrations');
   const [globalConfigCollapsed, toggleGlobalConfig] = useCollapseSection('global-config');
+  const [agyAllowSafe, setAgyAllowSafe] = useState(true);
+  const [agyAllowDispatch, setAgyAllowDispatch] = useState(false);
+  const agyPermInitRef = useRef(false);
+  const [agyCopyState, setAgyCopyState] = useState<string | null>(null);
+  const agyCopyTimerRef = useRef<any>(null);
   // Deliberately no default dispatch-target select here: CLI backends stay
   // opt-in per call via the worker argument (see the read-only workerOptIn
   // card below). Re-adding a default would silently re-route every
@@ -587,7 +626,15 @@ function WorkersPanel({ ctx }: { ctx: any }) {
     try {
       const [j, s, c, pr] = await Promise.all([get('/jobs'), get('/install/status'), get('/config'), get('/presets')]);
       if (j.ok) mergeJobs(j.jobs ?? []);
-      if (s.ok) setStatus(s.status);
+      if (s.ok) {
+        setStatus(s.status);
+        if (!agyPermInitRef.current && s.status?.agy) {
+          agyPermInitRef.current = true;
+          const init = agyInitialPermissionSelection(s.status.agy);
+          setAgyAllowSafe(init.allowSafe);
+          setAgyAllowDispatch(init.allowDispatch);
+        }
+      }
       if (c.ok) setConfig((prev: any) => prev ?? c.config);
       if (pr.ok) setPresetRoster({ defaultId: pr.defaultId, presets: pr.presets ?? [] });
     } catch { /* instance restarting */ }
@@ -640,16 +687,56 @@ function WorkersPanel({ ctx }: { ctx: any }) {
     tierProbeAbortRef.current.pro?.abort();
     tierProbeAbortRef.current.flash = null;
     tierProbeAbortRef.current.pro = null;
+    clearTimeout(agyCopyTimerRef.current);
   }, []);
 
-  const act = useCallback(async (target: string, confirmName?: string) => {
+  const copyAgyRules = useCallback(async (key: string, value: string) => {
+    if (!value) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        ok = true;
+      }
+    } catch {}
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = value;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {}
+    }
+    if (ok) {
+      setAgyCopyState(key);
+      clearTimeout(agyCopyTimerRef.current);
+      agyCopyTimerRef.current = setTimeout(() => setAgyCopyState(null), 1800);
+    } else {
+      setNotice(copy.copyFailed);
+    }
+  }, [copy]);
+
+  const act = useCallback(async (target: string, confirmName?: string, extraBody?: Record<string, any>) => {
     if (confirmName && !window.confirm(copy.confirmRestore(confirmName))) return;
     setBusy(true); setNotice(copy.working);
     try {
-      const r = await post('/install', { target });
+      const r = await post('/install', { target, ...(extraBody ?? {}) });
       if (r.ok === false) throw new Error(r.error);
       setNotice((r.actions ?? []).join('；'));
-      const s = await get('/install/status'); if (s.ok) setStatus(s.status);
+      const s = await get('/install/status');
+      if (s.ok) {
+        setStatus(s.status);
+        if (target === 'agy' || target === 'agy-uninstall') {
+          const nextSel = agyInitialPermissionSelection(s.status?.agy);
+          setAgyAllowSafe(nextSel.allowSafe);
+          setAgyAllowDispatch(nextSel.allowDispatch);
+        }
+      }
     } catch (e: any) { setNotice(String(e?.message ?? e)); } finally { setBusy(false); }
   }, [post, get, copy]);
 
@@ -980,7 +1067,86 @@ function WorkersPanel({ ctx }: { ctx: any }) {
             status?.claude?.installed ? <span style={S.chip(!!status?.claude?.hud)}>{copy.hud}</span> : null,
             'claude', 'claude-uninstall', (copy as any).tips.claude)}
           {integrationRow('Codex', !!status?.codex?.installed, null, 'codex', 'codex-uninstall', (copy as any).tips.codex)}
-          {integrationRow('Antigravity', !!status?.agy?.installed, null, 'agy', 'agy-uninstall', (copy as any).tips.agy)}
+          {(() => {
+            const agyInstalled = !!status?.agy?.installed;
+            const agyMode = status?.agy?.permissions?.mode;
+            const agyModeLabel = agyMode ? (copy.agyPermChips[agyMode] ?? agyMode) : null;
+            const agyPayload = { allowSafePermissions: agyAllowSafe, allowDispatchPermissions: agyAllowDispatch };
+            const selectedRulesText = agyDesktopPermissionsText(agyAllowSafe, agyAllowDispatch);
+            const safeRulesText = AGY_SAFE_PERMISSION_RULES.join('\n');
+            const allRulesText = AGY_ALL_PERMISSION_RULES.join('\n');
+            const agyTips = (copy as any).tips.agy;
+            return (
+              <div style={{ ...S.card, flexDirection: 'column' as const, alignItems: 'stretch', gap: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' as const }}>
+                  <span style={{ fontWeight: 600, fontSize: 13, minWidth: 92 }}>Antigravity</span>
+                  <span style={S.chip(agyInstalled)}>{agyInstalled ? `● ${copy.installed}` : `○ ${copy.notInstalled}`}</span>
+                  {agyInstalled && agyModeLabel && (
+                    <span style={S.chip(agyMode !== 'none')}>{agyModeLabel}</span>
+                  )}
+                  <span style={{ flex: 1 }} />
+                  {!agyInstalled && (
+                    <button style={S.btn} title={agyTips.install} disabled={busy}
+                      onClick={() => { void act('agy', undefined, agyPayload); }}>{copy.install}</button>
+                  )}
+                  {agyInstalled && (
+                    <button style={S.btn} title={agyTips.update} disabled={busy}
+                      onClick={() => { void act('agy', undefined, agyPayload); }}>{copy.update}</button>
+                  )}
+                  {agyInstalled && (
+                    <button style={{ ...S.btn, opacity: 0.75 }} title={agyTips.restore} disabled={busy}
+                      onClick={() => { void act('agy-uninstall', 'Antigravity'); }}>{copy.restore}</button>
+                  )}
+                </div>
+                <div style={{ borderTop: '1px solid rgba(128,128,128,0.16)', paddingTop: 9, display: 'flex', flexDirection: 'column' as const, gap: 8 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, opacity: 0.8 }}>{copy.agyPermsTitle}</div>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 7, cursor: 'pointer', fontSize: 12 }}>
+                    <input type="checkbox" style={{ marginTop: 3 }} checked={agyAllowSafe}
+                      onChange={(e) => setAgyAllowSafe(e.target.checked)} />
+                    <span>
+                      <span>{copy.agyPermsSafe}</span>
+                      <div style={{ ...S.mono, fontSize: 11, opacity: 0.6 }}>{copy.agyPermsSafeDesc}</div>
+                    </span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 7, cursor: 'pointer', fontSize: 12 }}>
+                    <input type="checkbox" style={{ marginTop: 3 }} checked={agyAllowDispatch}
+                      onChange={(e) => setAgyAllowDispatch(e.target.checked)} />
+                    <span>
+                      <span>{copy.agyPermsDispatch}</span>
+                      <div style={{ ...S.mono, fontSize: 11, opacity: 0.6 }}>{copy.agyPermsDispatchDesc}</div>
+                    </span>
+                  </label>
+                  <div style={{ borderTop: '1px dashed rgba(128,128,128,0.2)', paddingTop: 8, display: 'flex', flexDirection: 'column' as const, gap: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
+                      <span style={{ fontSize: 11.5, fontWeight: 600, opacity: 0.8 }}>{copy.agyDesktopTitle}</span>
+                      <span style={{ flex: 1 }} />
+                      <button type="button" style={{ ...S.btn, padding: '2px 9px', fontSize: 11.5 }}
+                        disabled={!selectedRulesText}
+                        onClick={() => { void copyAgyRules('selected', selectedRulesText); }}>
+                        {agyCopyState === 'selected' ? `✓ ${copy.copied}` : copy.copyBtn}
+                      </button>
+                      <button type="button" style={{ ...S.btn, padding: '2px 9px', fontSize: 11.5, opacity: 0.85 }}
+                        onClick={() => { void copyAgyRules('safe', safeRulesText); }}>
+                        {agyCopyState === 'safe' ? `✓ ${copy.copied}` : copy.copySafeBtn}
+                      </button>
+                      <button type="button" style={{ ...S.btn, padding: '2px 9px', fontSize: 11.5, opacity: 0.85 }}
+                        onClick={() => { void copyAgyRules('all', allRulesText); }}>
+                        {agyCopyState === 'all' ? `✓ ${copy.copied}` : copy.copyAllBtn}
+                      </button>
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.6 }}>{copy.agyDesktopHint}</div>
+                    <textarea readOnly rows={selectedRulesText ? Math.min(7, selectedRulesText.split('\n').length) : 2}
+                      value={selectedRulesText}
+                      placeholder={copy.agyDesktopEmpty}
+                      style={{
+                        ...S.input, ...S.mono, width: '100%', boxSizing: 'border-box' as const,
+                        fontSize: 11.5, resize: 'none' as const, opacity: selectedRulesText ? 0.9 : 0.65,
+                      }} />
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
           {integrationRow('Grok', !!status?.grok?.installed, null, 'grok', 'grok-uninstall', (copy as any).tips.grok)}
         </div>
       )}

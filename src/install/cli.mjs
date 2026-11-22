@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Usage: node src/install/cli.mjs <claude|codex|agy|grok|all|hud|uninstall-*> [--statusline] [--project]
+// Usage: node src/install/cli.mjs <claude|codex|agy|grok|all|hud|uninstall-*> [--statusline] [--project] [--agy-permissions=none|safe|all]
 
 import {
   installClaudeCode, installCodex, installAgy, installGrok,
@@ -7,8 +7,15 @@ import {
 } from './install.mjs';
 
 const cmd = process.argv[2];
-const flags = new Set(process.argv.slice(3));
-const opts = { statusline: flags.has('--statusline'), scope: flags.has('--project') ? 'project' : 'user' };
+const args = process.argv.slice(3);
+const flags = new Set(args);
+const permArg = args.find((a) => a.startsWith('--agy-permissions=') || a.startsWith('--permissions='));
+const agyPermissions = permArg ? permArg.slice(permArg.indexOf('=') + 1) : undefined;
+const opts = {
+  statusline: flags.has('--statusline'),
+  scope: flags.has('--project') ? 'project' : 'user',
+  ...(agyPermissions !== undefined ? { agyPermissions } : {}),
+};
 
 const run = {
   claude: () => [installClaudeCode(opts)],

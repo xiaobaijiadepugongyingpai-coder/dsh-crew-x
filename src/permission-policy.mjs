@@ -1,0 +1,256 @@
+// Per-task permission policy, ceiling enforcement, preset fallback, and
+// Windows ACL failure -> temporary git worktree degradation helpers.
+//
+// Deliberately imports ONLY Node built-ins (no @deepseek-ai/* imports) so both
+// the host-profile hub realm and the standalone/MCP realm share one source of
+// truth without duplicate module realms.
+
+import { execFile } from 'node:child_process';
+import { mkdirSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+
+export const PERMISSIONS = Object.freeze(['read-only', 'workspace-write', 'auto', 'full-access']);
+
+export const PERMISSION_LEVEL = Object.freeze({
+  'read-only': 0,
+  'workspace-write': 1,
+  auto: 1,
+  'full-access': 2,
+});
+
+export const SANDBOX_MODE_BY_PERMISSION = Object.freeze({
+  'read-only': 'read-only',
+  'workspace-write': 'workspace-write',
+  auto: 'workspace-write',
+  'full-access': 'danger-full-access',
+});
+
+export const MAX_PERMISSION_ENV = 'DSH_CREW_MAX_PERMISSION';
+
+export const FULL_ACCESS_WARNING =
+  'WARNING: Running with danger-full-access (unrestricted host filesystem/command access).';
+
+/** Structured permission policy violation. */
+export class PermissionError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'PermissionError';
+    this.code = code;
+  }
+}
+
+/** Validate that `value` is one of the 4 supported permission names. */
+export function assertValidPermission(value, label = 'permission') {
+  if (typeof value !== 'string' || !Object.hasOwn(PERMISSION_LEVEL, value)) {
+    throw new PermissionError(
+      `unknown ${label} ${JSON.stringify(value)} (expected: ${PERMISSIONS.join(', ')})`,
+      label === MAX_PERMISSION_ENV || label === 'maxPermission' ? 'invalid-max-permission' : 'unknown-permission',
+    );
+  }
+  return value;
+}
+
+/**
+ * Return the stricter of two optional permissions (lower level wins; for level-1
+ * tie between 'workspace-write' and 'auto', prefer 'workspace-write').
+ */
+export function stricterPermission(a, b) {
+  if (a === undefined) return b === undefined ? undefined : assertValidPermission(b, 'maxPermission');
+  assertValidPermission(a, 'maxPermission');
+  if (b === undefined) return a;
+  assertValidPermission(b, 'maxPermission');
+  const diff = PERMISSION_LEVEL[a] - PERMISSION_LEVEL[b];
+  if (diff < 0) return a;
+  if (diff > 0) return b;
+  if (a === 'workspace-write' || b === 'workspace-write') return 'workspace-write';
+  return a;
+}
+
+/**
+ * Read the effective permission ceiling from `env[DSH_CREW_MAX_PERMISSION]` and
+ * an optional explicit `maxPermission` override. When both are set, the
+ * stricter ceiling wins so a caller can never raise its own inherited cap.
+ */
+export function readMaxPermission({ maxPermission, env = process.env } = {}) {
+  const envRaw = env?.[MAX_PERMISSION_ENV];
+  const hasEnv = envRaw !== undefined && envRaw !== null && String(envRaw).trim() !== '';
+  const envCeiling = hasEnv ? assertValidPermission(String(envRaw).trim(), MAX_PERMISSION_ENV) : undefined;
+  const optCeiling = maxPermission !== undefined ? assertValidPermission(maxPermission, 'maxPermission') : undefined;
+  return stricterPermission(envCeiling, optCeiling);
+}
+
+/**
+ * Resolve and validate effective task permission, sandbox mode, ceiling, and
+ * child cap. Refuses unknown permissions, allow_concurrent_cwd conflicts, and
+ * ceiling escalations before any lock or runtime is touched.
+ */
+export function resolveWorkerPermission({
+  permission,
+  allowConcurrentCwd = false,
+  maxPermission,
+  env = process.env,
+} = {}) {
+  if (permission !== undefined) {
+    assertValidPermission(permission, 'permission');
+    if (allowConcurrentCwd && permission !== 'read-only') {
+      throw new PermissionError(
+        `allow_concurrent_cwd requires permission="read-only" (got ${JSON.stringify(permission)})`,
+        'concurrent-cwd-conflict',
+      );
+    }
+  }
+
+  // Method B default: concurrent cwd dispatches default to read-only; exclusive
+  // dispatches default to workspace-write (never full-access).
+  const effectivePermission = permission ?? (allowConcurrentCwd ? 'read-only' : 'workspace-write');
+  const ceiling = readMaxPermission({ maxPermission, env });
+
+  if (ceiling !== undefined && PERMISSION_LEVEL[effectivePermission] > PERMISSION_LEVEL[ceiling]) {
+    throw new PermissionError(
+      `permission "${effectivePermission}" exceeds maxPermission "${ceiling}"`,
+      'permission-ceiling-exceeded',
+    );
+  }
+
+  const effectiveSandboxMode = SANDBOX_MODE_BY_PERMISSION[effectivePermission];
+  const childMaxPermission = stricterPermission(ceiling, effectivePermission);
+
+  return {
+    permission: effectivePermission,
+    effective_sandbox_mode: effectiveSandboxMode,
+    maxPermission: ceiling,
+    childMaxPermission,
+    ...(effectivePermission === 'full-access' ? { permission_warning: FULL_ACCESS_WARNING } : {}),
+  };
+}
+
+/** Resolve the effective agent preset, preferring an explicit non-blank override. */
+export function resolveEffectivePreset({ preset, tier = 'flash', config = {} } = {}) {
+  if (typeof preset === 'string' && preset.trim() !== '') return preset.trim();
+  const configured = tier === 'flash' ? config?.preset_flash : config?.preset_pro;
+  if (typeof configured === 'string' && configured.trim() !== '') return configured.trim();
+  return 'default';
+}
+
+const ACL_DIRECT_PATTERNS = [
+  /SetNamedSecurityInfoW/i,
+  /windows-acl-run/i,
+  /materializeAclGrant/i,
+  /AclWriteGrant/i,
+];
+
+const ACL_CONTEXT_PATTERNS = [
+  /(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)[\s\S]{0,240}(?:acl|windows-acl|sandbox|runner|securityinfo|win32\s*5)/i,
+  /(?:acl|windows-acl|sandbox\s*runner|SANDBOX_UNAVAILABLE|Win32\s*5)[\s\S]{0,240}(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)/i,
+  /(?:acl|dacl|grantWrite|sandbox)[\s\S]{0,120}Win32\s*5\b/i,
+  /Win32\s*5\b[\s\S]{0,120}(?:acl|dacl|grantWrite|sandbox)/i,
+];
+
+function matchesAclText(text) {
+  if (typeof text !== 'string' || text === '') return false;
+  return ACL_DIRECT_PATTERNS.some((re) => re.test(text)) || ACL_CONTEXT_PATTERNS.some((re) => re.test(text));
+}
+
+/**
+ * Inspect an error, event, result object, or text tree for Windows ACL sandbox
+ * failures (`SetNamedSecurityInfoW`, `windows-acl-run`, or exit 127 ACL runner
+ * failure signatures). Cycle-safe.
+ */
+export function detectWindowsAclFailure(input, visited = new Set()) {
+  if (input === null || input === undefined) return false;
+  if (typeof input === 'string') return matchesAclText(input);
+  if (typeof input !== 'object') return false;
+  if (visited.has(input)) return false;
+  visited.add(input);
+
+  if (Array.isArray(input)) {
+    return input.some((item) => detectWindowsAclFailure(item, visited));
+  }
+
+  if (input instanceof Error) {
+    if (matchesAclText(input.message) || matchesAclText(input.stack)) return true;
+    if (input.cause !== undefined && detectWindowsAclFailure(input.cause, visited)) return true;
+    if (Array.isArray(input.errors) && detectWindowsAclFailure(input.errors, visited)) return true;
+  }
+
+  // Structured sandbox runner failure metadata (e.g., dsh-tool-bash meta/sandbox).
+  if (input.runnerFailed === true && (input.exitCode === 127 || input.mode === 'workspace-write')) {
+    return true;
+  }
+  if (input.sandbox?.runnerFailed === true && (input.exitCode === 127 || input.sandbox?.mode === 'workspace-write')) {
+    return true;
+  }
+
+  for (const key of Object.keys(input)) {
+    if (detectWindowsAclFailure(input[key], visited)) return true;
+  }
+  return false;
+}
+
+function safeRealpath(dir) {
+  try {
+    return realpathSync.native(dir);
+  } catch {
+    return resolve(dir);
+  }
+}
+
+/** Compute the isolated temporary worktree directory for a job id. */
+export function buildWorktreePath(jobId, baseDir = join(tmpdir(), 'dsh-crew-worktrees')) {
+  const resolvedBase = resolve(baseDir);
+  const sanitized = String(jobId ?? 'job')
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/^\.+$/, 'job')
+    .replace(/^\.+/, '');
+  const safeId = sanitized || 'job';
+  const candidate = resolve(resolvedBase, safeId);
+  const rel = relative(resolvedBase, candidate);
+  if (!rel || rel === '.' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`invalid worktree jobId ${JSON.stringify(jobId)}: escapes baseDir "${resolvedBase}"`);
+  }
+  return candidate;
+}
+
+async function defaultRunGit(args) {
+  const { stdout } = await execFileAsync('git', args, { windowsHide: true });
+  return stdout;
+}
+
+/**
+ * Create a clean detached git worktree under `%TEMP%\dsh-crew-worktrees\<jobId>`
+ * for `auto` mode Windows ACL fallback. Keeps `effective_sandbox_mode` at
+ * `'workspace-write'` rather than escalating permissions.
+ */
+export async function createTempWorktree({ cwd, jobId, baseDir, runGit = defaultRunGit }) {
+  let repoRootRaw;
+  try {
+    repoRootRaw = (await runGit(['-C', cwd, 'rev-parse', '--show-toplevel'])).trim();
+  } catch (err) {
+    throw new Error(`auto worktree fallback failed: "${cwd}" is not a git repository (${err?.message ?? err})`, { cause: err });
+  }
+  if (!repoRootRaw) {
+    throw new Error(`auto worktree fallback failed: git rev-parse returned empty root for "${cwd}"`);
+  }
+
+  const repoRoot = safeRealpath(repoRootRaw);
+  const canonCwd = safeRealpath(cwd);
+  const rel = relative(repoRoot, canonCwd);
+  const worktreePath = buildWorktreePath(jobId, baseDir);
+
+  mkdirSync(dirname(worktreePath), { recursive: true });
+  try {
+    await runGit(['-C', repoRoot, 'worktree', 'add', '--detach', worktreePath]);
+  } catch (err) {
+    throw new Error(`auto worktree fallback failed: git worktree add --detach failed for "${worktreePath}" (${err?.message ?? err})`, { cause: err });
+  }
+
+  const workerCwd = rel && rel !== '.' && !isAbsolute(rel) && !rel.startsWith('..')
+    ? join(worktreePath, rel)
+    : worktreePath;
+
+  return { worktreePath, repoRoot, cwd: workerCwd };
+}

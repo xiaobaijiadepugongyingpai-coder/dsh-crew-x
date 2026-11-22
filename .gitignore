@@ -8,3 +8,4 @@ node_modules/
 
 # logo design iterations stay local
 docs/images/dsh-crew-logo-v*.png
+.dsh-reports/

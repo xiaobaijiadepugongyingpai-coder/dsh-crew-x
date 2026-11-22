@@ -255,11 +255,18 @@ export function createHubClient({
 
   const hub = {
     probe: (binding) => call('/worker-probe', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(binding) }).then(b => b.result),
-    spawn: (spec) => call('/jobs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(spec),
-    }).then((b) => b.job),
+    spawn: (spec) => {
+      const payload = {
+        ...spec,
+        ...(spec?.permission !== undefined ? { permission: spec.permission } : {}),
+        ...(spec?.preset !== undefined ? { preset: spec.preset } : {}),
+      };
+      return call('/jobs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).then((b) => b.job);
+    },
     list: () => call('/jobs').then((b) => b.jobs),
     // The LLM routes the HOST has configured. Only the hub can answer this: the
     // MCP server is a separate process with no ctx.llm. Returns [] rather than
