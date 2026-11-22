@@ -78,18 +78,60 @@ export function resolvePersistedSessionPreset(session) {
  * POSIX path stays case-sensitive (two real directories may differ only by
  * case there). Foreign-platform paths are normalized in their own flavour, the
  * same way `src/paths.mjs` canonicalCwd treats them.
+ *
+ * Four Windows anomalies this has to get right, because `cwd` is a LOCKED
+ * session binding — a wrong answer either refuses a legitimate turn or silently
+ * admits a different workspace:
+ *
+ * 1. **Extended-length prefixes.** `realpathSync.native` legitimately returns
+ *    `\\?\D:\x\y` (or `\\?\UNC\srv\share` for a UNC path). Those name the SAME
+ *    directory as `D:\x\y` / `\\srv\share`, so the prefix is stripped before
+ *    normalising instead of producing a false SESSION_CWD_MISMATCH.
+ * 2. **Drive root vs drive-relative.** `D:\` is the root of a drive; `D:` is a
+ *    path RELATIVE to that drive's current directory. Stripping the trailing
+ *    separator collapsed both to `d:`, silently matching two different
+ *    places, so a root keeps its separator.
+ * 3. **Drive-relative paths.** `C:foo` is Windows-flavoured even though it has
+ *    no separator after the drive; it must not fall through to POSIX
+ *    normalisation (which is case-sensitive and would compare `C:foo` to
+ *    `c:foo` as different). They canonicalise deterministically, drive letter
+ *    lowercased.
+ * 4. POSIX behaviour and genuine mismatches are unchanged: a root path keeps a
+ *    single `/`, and two DIFFERENT workspaces still compare unequal.
+ *
+ * macOS/APFS case-insensitivity is deliberately OUT OF SCOPE (owner's ruling):
+ * a POSIX path here stays case-sensitive.
  */
 export function canonicalSessionCwd(value) {
   const raw = nonBlankString(value);
   if (raw === null) return null;
-  const trimmed = raw.trim();
+  let trimmed = raw.trim();
+
+  // 1. Extended-length prefixes name the ordinary path. Handle the UNC form
+  //    first, because `\\?\UNC\` also starts with `\\?\`.
+  if (/^\\\\\?\\UNC\\/i.test(trimmed)) {
+    trimmed = `\\\\${trimmed.slice('\\\\?\\UNC\\'.length)}`;
+  } else if (trimmed.startsWith('\\\\?\\')) {
+    trimmed = trimmed.slice('\\\\?\\'.length);
+  }
+
   const unified = trimmed.replace(/\\/g, '/');
-  const windowsFlavoured = /^[a-zA-Z]:\//.test(unified) || unified.startsWith('//');
-  const normalized = windowsFlavoured
-    ? win32.normalize(unified.replace(/\//g, '\\')).replace(/\\/g, '/')
-    : posix.normalize(unified);
-  const withoutTrailingSlash = normalized.replace(/\/+$/, '');
-  return windowsFlavoured ? withoutTrailingSlash.toLowerCase() : withoutTrailingSlash;
+  // A drive-qualified path (absolute `D:/x` OR drive-relative `C:foo`) is
+  // Windows-flavoured; a leading `//` is UNC.
+  const windowsFlavoured = /^[a-zA-Z]:/.test(unified) || unified.startsWith('//');
+
+  if (!windowsFlavoured) {
+    const normalized = posix.normalize(unified);
+    // 4. A POSIX root stays `/`; any other path loses trailing slashes.
+    return normalized === '/' ? '/' : normalized.replace(/\/+$/, '');
+  }
+
+  const normalized = win32.normalize(unified.replace(/\//g, '\\')).replace(/\\/g, '/');
+  const lowered = normalized.toLowerCase();
+  // 2. A drive root (`d:/`, and a UNC share root) keeps its separator so it can
+  //    never collide with the drive-relative `d:` or with `d:foo`.
+  if (/^[a-z]:\/$/.test(lowered)) return lowered;
+  return lowered.replace(/\/+$/, '');
 }
 
 /**
@@ -163,6 +205,15 @@ export function createPersistentSessionRecord({
     degradedFrom: null,
     turns: 0,
     status: 'idle',
+    // Monotonic per-session turn counter. A turn that already timed out can
+    // settle LATE (its hung run() finally resolves); without an epoch that late
+    // write-back would clobber a SUCCESSOR turn's `running` state and silently
+    // release the busy lock, admitting two turns onto one handle. Every write to
+    // `status`/`activeJob` from a turn is guarded by "is this still MY epoch?".
+    turnEpoch: 0,
+    // How long one turn may stay running before the hub reclaims the session
+    // (see DEFAULT_PERSISTENT_TURN_TIMEOUT_MS). Per-session override; 0 disables.
+    turnTimeoutMs: null,
     lastActiveAt: lastActiveAt ?? now,
     handle: null,
     activeJob: null,

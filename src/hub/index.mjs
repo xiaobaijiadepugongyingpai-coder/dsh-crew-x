@@ -42,6 +42,16 @@ const DEFAULT_REAPER_INTERVAL_MS = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const MAX_IDLE_TIMEOUT_MINUTES = 1440;
 
+// How long ONE persistent turn may stay `running` before the hub gives the
+// session back. Without this, an agent/tool/worktree that never settles leaves
+// `rec.status === 'running'` forever: the idle reaper skips running sessions by
+// design, so every later turn on that session would be 409 SESSION_BUSY until
+// someone cancelled the job, closed the session, or restarted the hub. The
+// client-side `timeout_seconds` only bounds the MCP poll, not the hub's turn.
+// 30 minutes is generous for a real worker turn and short enough that a wedged
+// session recovers on its own. `0` or negative disables the watchdog entirely.
+const DEFAULT_PERSISTENT_TURN_TIMEOUT_MS = 1_800_000;
+
 /** True when `value` is a non-blank string. */
 function nonBlank(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
@@ -659,10 +669,17 @@ export class WorkerRegistry {
     rec.permission = perm.permission;
     rec.turns += 1;
     rec.lastActiveAt = Date.now();
+    // Claim this record for the new turn. The epoch is monotonic, so a zombie
+    // callback from an earlier turn can always tell it no longer owns the
+    // record — object identity alone cannot, because a settled job's late
+    // `finally` still holds a reference to the job it ran.
+    rec.turnEpoch += 1;
+    const turnEpoch = rec.turnEpoch;
 
     const job = {
       id: `hub-${this.nextId++}-${Date.now().toString(36)}`,
       sessionId: rec.sessionId, persistent: true, turnIndex: rec.turns,
+      turnEpoch,
       tier, model, provider, effort, task, source, cwd: rec.cwd,
       permission: perm.permission,
       effective_sandbox_mode: perm.effective_sandbox_mode,
@@ -675,9 +692,11 @@ export class WorkerRegistry {
       tokens: { input: 0, output: 0, reasoning: 0 },
       startedAt: new Date().toISOString(), endedAt: null,
       result: null, error: null, stopReason: null, handle: rec.handle, waiters: [], texts: [],
+      watchdogTimer: null,
     };
     this.jobs.set(job.id, job);
     rec.activeJob = job;
+    this.armTurnWatchdog(rec, job, spec);
 
     const worktreeFn = spec.createWorktree ?? this.createWorktree ?? createTempWorktree;
 
@@ -751,20 +770,101 @@ export class WorkerRegistry {
 
     job.promise = run()
       .catch((err) => {
-        if (job.status === 'running') job.status = 'failed';
+        if (this.stillOwnsTurn(rec, job) && job.status === 'running') job.status = 'failed';
         job.error = job.error ?? (err?.message ?? String(err));
       })
       .finally(() => {
+        // A0/A1: a zombie turn (one that timed out and settled later) must not
+        // touch the record at all — a successor may own it by now. The job's own
+        // bookkeeping still finishes, so a caller waiting on it is released.
+        this.clearTurnWatchdog(job);
         job.endedAt = new Date().toISOString();
         job.currentTool = null;
-        rec.lastActiveAt = Date.now();
-        // Only this turn may release the record: a cancelled turn whose
-        // successor already started must not mark the session idle.
-        if (rec.activeJob === job && rec.status === 'running') rec.status = 'idle';
+        if (this.stillOwnsTurn(rec, job)) {
+          rec.lastActiveAt = Date.now();
+          if (rec.status === 'running') rec.status = 'idle';
+        }
         this.publish();
         for (const w of job.waiters.splice(0)) w();
       });
     return job;
+  }
+
+  /** Cancel one turn's watchdog timer (idempotent, safe on a fired timer). */
+  clearTurnWatchdog(job) {
+    if (job?.watchdogTimer != null) {
+      try { clearTimeout(job.watchdogTimer); } catch {}
+      job.watchdogTimer = null;
+    }
+  }
+
+  /**
+   * Does this turn still own its session record?
+   *
+   * TWO guards, and both must pass. `turnEpoch` is the primary authority: it is
+   * monotonic, so a turn that already timed out (or was superseded) can never
+   * be mistaken for the current owner — object identity alone would let a
+   * settled job's late callback clobber a successor's `running` state and
+   * silently release the busy lock. `activeJob` stays as belt-and-braces for the
+   * close/cancel paths, which null it out directly.
+   */
+  stillOwnsTurn(rec, job) {
+    if (rec === null || rec === undefined || job === null || job === undefined) return false;
+    if (rec.turnEpoch !== job.turnEpoch) return false;
+    return rec.activeJob === job;
+  }
+
+  /**
+   * Arm the per-turn watchdog.
+   *
+   * Without it a turn whose agent never settles leaves the record `running`
+   * forever, and the idle reaper deliberately skips running sessions — so every
+   * later turn would be SESSION_BUSY with no way back short of a cancel, a close
+   * or a hub restart. `0`/negative (or a non-finite value) disables it.
+   */
+  armTurnWatchdog(rec, job, spec = {}) {
+    const configured = spec.turnTimeoutMs ?? this.persistentTurnTimeoutMs ?? DEFAULT_PERSISTENT_TURN_TIMEOUT_MS;
+    const ms = Number(configured);
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    job.watchdogTimer = setTimeout(() => this.fireTurnWatchdog(rec, job, ms), ms);
+    // Never hold the process (or `node --test`) open for a watchdog.
+    job.watchdogTimer.unref?.();
+  }
+
+  /**
+   * The watchdog fired: give the session back.
+   *
+   * The timed-out `run()` promise may never settle, so the release CANNOT be
+   * left to its `finally` — this handler performs it. The agent handle is
+   * deliberately NOT disposed: the whole point is to keep the session usable,
+   * exactly as the `needs_input` path does.
+   */
+  fireTurnWatchdog(rec, job, ms) {
+    // A newer turn may already own the record (the hung turn was superseded).
+    // Then this timer is a stale no-op — it must not touch anything.
+    if (!this.stillOwnsTurn(rec, job)) {
+      this.clearTurnWatchdog(job);
+      return;
+    }
+    this.clearTurnWatchdog(job);
+    const minutes = Math.round((ms / 60_000) * 10) / 10;
+    try { job.handle?.agent?.cancel?.({ kind: 'timeout', reason: 'persistent-turn-timeout' }); } catch {}
+    job.status = 'failed';
+    job.stopReason = 'timeout';
+    job.error = `persistent turn timed out after ${ms} ms (${minutes} min): the worker never settled, so the hub reclaimed the session. The session itself is intact and returned to idle — the next turn on this session_id is accepted; retry the task, or close the session with dsh_session_close if it should be abandoned.`;
+    job.currentTool = null;
+    job.endedAt = new Date().toISOString();
+    // Reclaim the record so later turns are admitted again. Guarded by BOTH
+    // ownership checks inside stillOwnsTurn, re-verified here because the guards
+    // are what make the state transition safe.
+    if (this.stillOwnsTurn(rec, job)) {
+      rec.lastActiveAt = Date.now();
+      if (rec.status === 'running') rec.status = 'idle';
+    }
+    this.publish();
+    // A caller blocked in hub.get(id, wait) must not stay blocked on a turn that
+    // is now failed.
+    for (const w of job.waiters.splice(0)) w();
   }
 
   /** Open a NEW persistent session and run its first turn. */
@@ -825,6 +925,14 @@ export class WorkerRegistry {
     const rec = this.persistentSessions.get(sessionId) ?? await this.recoverPersistentSession(sessionId, spec);
     if (rec.status === 'running') {
       throw new HubRequestError('session is busy', { status: 409, code: 'SESSION_BUSY' });
+    }
+    // A follow-up turn takes its cwd from the caller, so it needs the same
+    // absolute-path guard the creating turn and the resume path already have:
+    // a relative cwd would resolve against whatever process the hub happens to
+    // be, i.e. a different workspace than the caller meant, and the locked-cwd
+    // comparison below would then be made against a path that never named one.
+    if (spec.cwd !== undefined && !isAbsoluteCwd(spec.cwd)) {
+      throw new HubRequestError('cwd must be an absolute path', { status: 400, code: 'INVALID_CWD' });
     }
     // cwd is locked; preset is inherited unless the caller names one explicitly.
     validateSessionTurnBinding({
@@ -924,6 +1032,16 @@ export class WorkerRegistry {
       if (err instanceof HubRequestError && err.code === 'SESSION_RESUME_FAILED') throw err;
       throw fail(err?.message ?? String(err));
     }
+    // A close can land while `agents.resume()` is in flight, and inserting the
+    // record unconditionally here would REVIVE a session the caller just
+    // destroyed — resurrecting a closed id is the one thing the tombstone exists
+    // to prevent. Re-check after the await: dispose the runtime we just built and
+    // refuse, instead of leaking a hidden live agent for a closed session.
+    if (this.closedSessions.has(sessionId)) {
+      try { await handle?.dispose(); } catch {}
+      this.publish();
+      throw new HubRequestError('session is closed', { status: 409, code: 'SESSION_CLOSED' });
+    }
     rec.handle = handle;
     // Continue the turn counter from the persisted log instead of restarting at 1.
     rec.turns = countSettledTurns(handle?.agent?.session);
@@ -958,12 +1076,16 @@ export class WorkerRegistry {
       rec.handle = null;
       const active = rec.activeJob;
       rec.activeJob = null;
-      this.persistentSessions.delete(sessionId);
-      if (active !== null && active !== undefined && active.status === 'running') {
-        try { active.handle?.agent?.cancel?.({ kind: 'user' }); } catch {}
-        active.status = 'cancelled';
-        active.error = 'session closed';
+      if (active !== null && active !== undefined) {
+        // Nothing may fire for a closed session.
+        this.clearTurnWatchdog(active);
+        if (active.status === 'running') {
+          try { active.handle?.agent?.cancel?.({ kind: 'user' }); } catch {}
+          active.status = 'cancelled';
+          active.error = 'session closed';
+        }
       }
+      this.persistentSessions.delete(sessionId);
     }
     this.rememberClosedSession(sessionId, reason);
     if (handle !== null) { try { await handle.dispose(); } catch {} }
@@ -1001,13 +1123,15 @@ export class WorkerRegistry {
     const job = this.jobs.get(id);
     if (!job) return undefined;
     if (job.status === 'running') {
+      // The turn is over either way, so its watchdog must not outlive it.
+      this.clearTurnWatchdog(job);
       job.status = 'cancelled';
       job.error = 'cancelled by request';
       const rec = job.persistent === true ? this.persistentSessions.get(job.sessionId) : undefined;
       if (rec !== undefined) {
         // A persistent session keeps its handle: cancel only the in-flight turn.
         try { job.handle?.agent?.cancel?.({ kind: 'user' }); } catch {}
-        if (rec.activeJob === job) { rec.status = 'idle'; rec.lastActiveAt = Date.now(); }
+        if (this.stillOwnsTurn(rec, job)) { rec.status = 'idle'; rec.lastActiveAt = Date.now(); }
       } else {
         try { await job.handle?.dispose(); } catch {}
       }
@@ -1047,6 +1171,35 @@ function isLoopbackAddress(address) {
   if (!n.startsWith('::ffff:')) return false;
   return isIpv4Loopback(n.slice(7));
 }
+/**
+ * True when the request declares a JSON body.
+ *
+ * A `; charset=utf-8` suffix is accepted (that is still application/json); a
+ * `text/plain` body is not. This is the ONE check every state-mutating POST
+ * route uses, so a body cannot arrive through a browser "simple request" that
+ * skips a CORS preflight: a cross-origin `text/plain` POST is delivered without
+ * any preflight, and without this guard a hostile page could drive this hub.
+ * `application/x-www-form-urlencoded` and `multipart/form-data` are simple
+ * requests too, so they are refused the same way.
+ */
+function hasJsonContentType(req) {
+  const raw = req?.headers?.['content-type'];
+  if (typeof raw !== 'string') return false;
+  const mediaType = raw.split(';', 1)[0].trim().toLowerCase();
+  return mediaType === 'application/json';
+}
+
+/** The uniform 415 refusal for a mutating POST without a JSON body. */
+function requireJsonContentType(res, req) {
+  if (hasJsonContentType(req)) return false;
+  sendJson(res, 415, {
+    ok: false,
+    error: 'application/json required: state-mutating requests must declare content-type: application/json',
+    code: 'UNSUPPORTED_MEDIA_TYPE',
+  });
+  return true;
+}
+
 function isLoopbackRequest(req) {
   if (!isLoopbackAddress(req.socket?.remoteAddress)) return false;
   const host = (req.headers.host ?? '').split(':')[0].toLowerCase();
@@ -1202,7 +1355,7 @@ export async function apply(ctx) {
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' }, { allow: 'POST' });
-        if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return sendJson(res, 415, { ok: false, error: 'application/json required' });
+        if (requireJsonContentType(res, req)) return;
         try {
           const body = await readBody(req);
           if (typeof body.provider !== 'string' || body.provider.trim() === '' || typeof body.model !== 'string' || body.model.trim() === '') return sendJson(res, 400, { ok: false, error: 'provider and model required' });
@@ -1248,6 +1401,7 @@ export async function apply(ctx) {
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' }, { allow: 'POST' });
+        if (requireJsonContentType(res, req)) return;
         try {
           const body = await readBody(req);
           adoptLang(body?.lang);
@@ -1291,11 +1445,13 @@ export async function apply(ctx) {
             return sendJson(res, 200, { ok: true, job: hub.view(job, true) });
           }
           if (req.method === 'POST' && parts.length === 0) {
+            if (requireJsonContentType(res, req)) return undefined;
             const payload = await readBody(req);
             const job = await hub.spawn(payload);
             return sendJson(res, 200, { ok: true, job: hub.view(job) });
           }
           if (req.method === 'POST' && parts.length === 2 && parts[1] === 'cancel') {
+            if (requireJsonContentType(res, req)) return undefined;
             const job = await hub.cancel(parts[0]);
             if (!job) return sendJson(res, 404, { ok: false, error: 'no such job' });
             return sendJson(res, 200, { ok: true, job: hub.view(job, true) });
@@ -1318,6 +1474,7 @@ export async function apply(ctx) {
             return sendJson(res, 200, { ok: true, sessions: hub.listPersistentSessions() });
           }
           if (req.method === 'POST' && parts.length === 2 && parts[1] === 'turns') {
+            if (requireJsonContentType(res, req)) return undefined;
             const sessionId = decodeURIComponent(parts[0]);
             const body = await readJsonBody(req);
             adoptLang(body?.lang);
@@ -1325,6 +1482,7 @@ export async function apply(ctx) {
             return sendJson(res, 200, { ok: true, session_id: job.sessionId, turn_index: job.turnIndex, job: hub.view(job, true) });
           }
           if (req.method === 'POST' && parts.length === 2 && parts[1] === 'close') {
+            if (requireJsonContentType(res, req)) return undefined;
             const sessionId = decodeURIComponent(parts[0]);
             const body = await readJsonBody(req).catch((err) => {
               // A close request may legitimately have no body at all; still
@@ -1363,7 +1521,10 @@ export async function apply(ctx) {
             adoptLang(new URL(req.url, 'http://localhost').searchParams.get('lang'));
             return sendJson(res, 200, { ok: true, config: readGlobalConfig() });
           }
-          if (req.method === 'POST') return sendJson(res, 200, { ok: true, config: writeGlobalConfig(await readBody(req)) });
+          if (req.method === 'POST') {
+            if (requireJsonContentType(res, req)) return undefined;
+            return sendJson(res, 200, { ok: true, config: writeGlobalConfig(await readBody(req)) });
+          }
           return sendJson(res, 405, { ok: false, error: 'GET or POST' }, { allow: 'GET, POST' });
         } catch (err) {
           return sendJson(res, 500, { ok: false, error: err?.message ?? String(err) });
@@ -1437,6 +1598,7 @@ export async function apply(ctx) {
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' });
+        if (requireJsonContentType(res, req)) return;
         try {
           // The entry comes from the panel form so unsaved edits can be probed.
           const entry = await readBody(req);
@@ -1468,6 +1630,7 @@ export async function apply(ctx) {
       handler: async (req, res) => {
         if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' }, { allow: 'POST' });
+        if (requireJsonContentType(res, req)) return;
         try {
           const {
             target,
