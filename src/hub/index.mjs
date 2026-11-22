@@ -25,6 +25,73 @@ import {
   detectWindowsAclFailure,
   createTempWorktree,
 } from '../permission-policy.mjs';
+import {
+  HubRequestError,
+  createPersistentSessionRecord,
+  resolvePersistedSessionPreset,
+  summarizePersistentSession,
+  validateSessionTurnBinding,
+} from './persistent-sessions.mjs';
+
+// Persistent-session pool limits. The tombstone table is bounded so a
+// long-lived hub cannot grow without limit, while still remembering every
+// recently closed id (a closed session must never be revived, not even by the
+// Hub-restart resume path).
+const CLOSED_SESSIONS_LIMIT = 1000;
+const DEFAULT_REAPER_INTERVAL_MS = 30_000;
+const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
+const MAX_IDLE_TIMEOUT_MINUTES = 1440;
+
+/** True when `value` is a non-blank string. */
+function nonBlank(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
+
+/** The number of settled turns a persisted session log recorded. */
+function countSettledTurns(session) {
+  const events = Array.isArray(session?.events) ? session.events : [];
+  let turns = 0;
+  for (const event of events) if (event?.type === 'turn/end') turns += 1;
+  return turns;
+}
+
+/**
+ * Fold one session event into a turn job's counters.
+ *
+ * Shared by the one-shot and persistent runners so the two views report the
+ * same turn/step/tool/token numbers; `markAcl` records a Windows ACL failure
+ * for the auto-worktree degradation decision.
+ */
+function applyJobEvent(job, event, markAcl) {
+  switch (event?.type) {
+    case 'step/start':
+      job.turn = event.data?.turn ?? job.turn;
+      job.step = event.data?.step ?? job.step;
+      break;
+    case 'tool/call': job.currentTool = event.data?.name ?? null; job.toolCalls += 1; break;
+    case 'tool/result':
+      if (detectWindowsAclFailure(event)) markAcl();
+      job.currentTool = null;
+      break;
+    case 'assistant/message': {
+      const u = event.data?.usage;
+      if (u) {
+        job.tokens.input += u.inputTokens ?? 0;
+        job.tokens.output += u.outputTokens ?? 0;
+        job.tokens.reasoning += u.reasoningTokens ?? 0;
+      }
+      const text = (event.data?.message?.content ?? [])
+        .filter((c) => c?.type === 'text').map((c) => c.text).join('');
+      if (text) job.texts.push(text);
+      break;
+    }
+    case 'turn/end':
+      if (detectWindowsAclFailure(event.data?.reason)) markAcl();
+      job.stopReason = event.data?.reason?.kind ?? null;
+      job.reasonDetail = event.data?.reason;
+      break;
+  }
+}
 
 // No @deepseek-ai imports here on purpose: this plugin is loaded into the
 // profile realm, and importing our own package copies would create duplicate
@@ -109,11 +176,36 @@ function clipTask(task, cap = 300) {
 }
 
 export class WorkerRegistry {
-  constructor(ctx, shard = createShardWriter('hub')) {
+  constructor(ctx, shard = createShardWriter('hub'), options = {}) {
     this.ctx = ctx;
     this.jobs = new Map();
     this.nextId = 1;
     this.shard = shard;
+    // Persistent session pool (opt-in). `closedSessions` is a tombstone table:
+    // a closed id must stay closed, so a later turn cannot silently revive it
+    // through the Hub-restart resume path.
+    this.persistentSessions = new Map();
+    this.closedSessions = new Map();
+    // Single-flight registry for Hub-restart recovery: two turns arriving for
+    // the same unknown id must share ONE resume, not race two.
+    this.resumeInFlight = new Map();
+    // The interval is a live knob: setting `registry.reaperIntervalMs = 0`
+    // disables reaping even when the timer was armed (tests drive
+    // reapIdleSessions(now) themselves). It can also be pre-set on the
+    // prototype/subclass, or injected as a constructor option.
+    const configuredReaper = options.reaperIntervalMs ?? this.reaperIntervalMs;
+    this.reaperIntervalMs = configuredReaper === undefined ? DEFAULT_REAPER_INTERVAL_MS : Number(configuredReaper);
+    this.reaperTimer = null;
+    if (Number.isFinite(this.reaperIntervalMs) && this.reaperIntervalMs > 0) {
+      this.reaperTimer = setInterval(() => {
+        if (!(this.reaperIntervalMs > 0)) return;
+        try { this.reapIdleSessions(); } catch (err) {
+          this.ctx?.logger?.warn?.(`dsh-crew: idle session reaper failed: ${err?.message ?? err}`);
+        }
+      }, this.reaperIntervalMs);
+      // Never hold the process open for a reaper.
+      this.reaperTimer.unref?.();
+    }
   }
 
   view(job, withResult = false) {
@@ -131,6 +223,8 @@ export class WorkerRegistry {
       ...(job.degraded_from ? { degraded_from: job.degraded_from } : {}),
       startedAt: job.startedAt, endedAt: job.endedAt,
       ...(job.questions === undefined ? {} : { questions: job.questions }),
+      persistent: Boolean(job.persistent),
+      turnIndex: job.turnIndex ?? null,
     };
     if (withResult) {
       v.result = job.result; v.error = job.error; v.stopReason = job.stopReason;
@@ -143,7 +237,21 @@ export class WorkerRegistry {
     this.shard.publish([...this.jobs.values()].map((j) => this.view(j)));
   }
 
-  async spawn({
+  /**
+   * Dispatch one unit of work.
+   *
+   * `sessionId` resumes a persistent session (a later turn); `persistent: true`
+   * opens a new persistent session and runs its first turn; anything else is
+   * the original one-shot job, unchanged.
+   */
+  async spawn(spec = {}) {
+    const sessionId = nonBlank(spec?.sessionId);
+    if (sessionId !== null) return this.spawnPersistentTurn({ ...spec, sessionId });
+    if (spec?.persistent === true) return this.spawnPersistentSession(spec);
+    return this.spawnOneShot(spec);
+  }
+
+  async spawnOneShot({
     task,
     tier = 'flash',
     effort = 'max',
@@ -213,34 +321,7 @@ export class WorkerRegistry {
 
       const onEvent = (session, event) => {
         if (!attemptActive) return;
-        switch (event?.type) {
-          case 'step/start':
-            job.turn = event.data?.turn ?? job.turn;
-            job.step = event.data?.step ?? job.step;
-            break;
-          case 'tool/call': job.currentTool = event.data?.name ?? null; job.toolCalls += 1; break;
-          case 'tool/result':
-            if (detectWindowsAclFailure(event)) aclDetected = true;
-            job.currentTool = null;
-            break;
-          case 'assistant/message': {
-            const u = event.data?.usage;
-            if (u) {
-              job.tokens.input += u.inputTokens ?? 0;
-              job.tokens.output += u.outputTokens ?? 0;
-              job.tokens.reasoning += u.reasoningTokens ?? 0;
-            }
-            const text = (event.data?.message?.content ?? [])
-              .filter((c) => c?.type === 'text').map((c) => c.text).join('');
-            if (text) job.texts.push(text);
-            break;
-          }
-          case 'turn/end':
-            if (detectWindowsAclFailure(event.data?.reason)) aclDetected = true;
-            job.stopReason = event.data?.reason?.kind ?? null;
-            job.reasonDetail = event.data?.reason;
-            break;
-        }
+        applyJobEvent(job, event, () => { aclDetected = true; });
         this.publish();
       };
 
@@ -367,11 +448,18 @@ export class WorkerRegistry {
         if (job.status === 'running') job.status = 'failed';
         job.error = job.error ?? (err?.message ?? String(err));
       })
-      .finally(() => {
+      .finally(async () => {
         job.endedAt = new Date().toISOString();
         job.currentTool = null;
         this.publish();
         for (const w of job.waiters.splice(0)) w();
+        // One-shot jobs own their runtime for exactly one turn: the session has
+        // been flushed above, so the handle must not outlive the job (it used to
+        // leak one live agent per dispatch). Persistent turns keep theirs.
+        if (job.persistent !== true) {
+          try { await job.handle?.dispose(); } catch {}
+          job.handle = null;
+        }
       });
 
     this.publish();
@@ -389,23 +477,564 @@ export class WorkerRegistry {
     return job;
   }
 
+  // ---------- persistent sessions (opt-in) ----------
+  //
+  // A persistent session is ONE reusable DSH agent/session that several turns
+  // run on, so a forwarded subagent keeps its conversation and tool context
+  // instead of paying for a cold context every dispatch. The record keeps the
+  // caller-facing identity (sessionId + the cwd it was created in) apart from
+  // the runtime it currently runs on (dshSessionId + effectiveCwd), which is
+  // what lets an `auto` Windows ACL failure move the runtime onto a temporary
+  // git worktree while later turns keep passing the original session_id/cwd.
+
+  /** The {provider, model, reasoningEffort} agent options for one record. */
+  agentOptionsFor(rec) {
+    const current = rec?.selectionRef?.current ?? {};
+    return {
+      ...(current.provider === undefined ? {} : { provider: current.provider }),
+      ...(current.model === undefined ? {} : { model: current.model }),
+      ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: current.reasoningEffort }),
+    };
+  }
+
+  /**
+   * Turn-event listeners live on the agent for the WHOLE session (it outlives
+   * one turn), so they forward into whatever turn is active right now and
+   * ignore events once that turn settled. ACL detection is recorded on the turn
+   * job, because the degradation decision is per turn.
+   */
+  installRecordEventListeners(rec, agentCtx) {
+    agentCtx.on('session/event', (_session, event) => {
+      const job = rec.activeJob;
+      if (job === null || job === undefined || job.status !== 'running') return;
+      applyJobEvent(job, event, () => { job.aclDetected = true; });
+      this.publish();
+    });
+    agentCtx.on('agent/error', (payload) => {
+      const job = rec.activeJob;
+      if (job === null || job === undefined || job.status !== 'running') return;
+      const err = payload?.error;
+      if (detectWindowsAclFailure(err)) job.aclDetected = true;
+      if (job.status !== 'needs_input') job.error = err?.message ?? String(err);
+    });
+  }
+
+  /** Open a fresh runtime for a record (first turn, recovery, or re-created after degradation). */
+  async openAgentHandle(rec, { attemptCwd, attemptSessionId, presetId, turnJob }) {
+    const handle = await this.ctx.agents.create({
+      sessionId: attemptSessionId,
+      meta: { cwd: attemptCwd, ...(presetId === undefined ? {} : { agentPreset: presetId }) },
+      agentOptions: this.agentOptionsFor(rec),
+      setup: async (agentCtx) => {
+        installModelSelection(agentCtx, rec.selectionRef);
+        const presets = this.ctx.get('agentPresets');
+        if (presets !== undefined) await presets.mount(agentCtx, presetId);
+        // Nobody attends a worker session, so a question would wait forever
+        // (#13). A persistent session outlives one turn, so the handoff follows
+        // the record's currently active job instead of this turn's job object.
+        const job = () => rec.activeJob;
+        installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
+        this.installRecordEventListeners(rec, agentCtx);
+      },
+    });
+    rec.handle = handle;
+    turnJob.handle = handle;
+    return handle;
+  }
+
+  /**
+   * Run exactly ONE turn on the record's runtime.
+   *
+   * `reuseHandle` is false only when this turn must build a runtime (first
+   * turn, post-restart recovery, or the retry after an ACL degradation).
+   * Returns `{ aclFailed }` instead of throwing when the turn hit a Windows ACL
+   * failure in `auto` mode and may still be retried elsewhere.
+   */
+  async runPersistentAttempt(rec, job, {
+    attemptCwd, attemptSessionId, presetId, perm, allowDegrade, reuseHandle, task,
+  }) {
+    let handle = reuseHandle ? rec.handle : null;
+    try {
+      if (handle === null) {
+        handle = await this.openAgentHandle(rec, { attemptCwd, attemptSessionId, presetId, turnJob: job });
+      } else {
+        job.handle = handle;
+      }
+      if (job.status === 'needs_input' || job.status === 'cancelled') return { aclFailed: false };
+      try {
+        // Group the worker session under the workspace of its cwd, exactly as
+        // the one-shot path does, so a persistent worker stays visible there.
+        const registry = this.ctx.get('workspaceRegistry');
+        if (registry !== undefined) {
+          const ws = (await registry.resolveByPath(attemptCwd)) ?? (await registry.create(attemptCwd));
+          await ws.attachSession(attemptSessionId);
+        }
+      } catch (err) {
+        this.ctx.logger?.warn?.(`dsh-crew: workspace attach failed for ${attemptCwd}: ${err?.message ?? err}`);
+      }
+      await handle.agent.whenIdle();
+      if (typeof handle?.agent?.session?.append !== 'function') {
+        throw new Error('agent session does not support sandbox/mode append');
+      }
+      // Sandbox level is a per-turn choice on a persistent session: append the
+      // new mode before the followup so this turn runs under it.
+      await handle.agent.session.append('sandbox/mode', { mode: perm.effective_sandbox_mode });
+      job.permission = perm.permission;
+      job.effective_sandbox_mode = perm.effective_sandbox_mode;
+      handle.agent.followup(userMessage(task));
+      await handle.agent.whenIdle();
+      if (job.status !== 'needs_input' && job.status !== 'cancelled') {
+        job.result = job.texts.at(-1) ?? '';
+        job.status = job.stopReason === 'completed' ? 'done' : 'failed';
+      }
+      if (job.status === 'failed' && !job.error) job.error = `turn ended: ${job.stopReason ?? 'unknown'}`;
+      await this.ctx.sessions.flush(handle.agent.session);
+    } catch (err) {
+      if (detectWindowsAclFailure(err)) job.aclDetected = true;
+      const isAcl = job.aclDetected === true || detectWindowsAclFailure([job.error, job.reasonDetail, err]);
+      if (job.status === 'cancelled') return { aclFailed: false };
+      if (allowDegrade && perm.permission === 'auto' && isAcl) {
+        // The caller rebuilds this turn on a worktree, so this runtime is done.
+        try { await handle?.dispose(); } catch {}
+        if (rec.handle === handle) rec.handle = null;
+        job.handle = null;
+        return { aclFailed: true };
+      }
+      if (!reuseHandle) {
+        try { await handle?.dispose(); } catch {}
+        if (rec.handle === handle) rec.handle = null;
+        job.handle = null;
+      }
+      throw err;
+    }
+
+    const isAcl = job.aclDetected === true || detectWindowsAclFailure([job.error, job.reasonDetail]);
+    if (job.status !== 'cancelled' && job.status !== 'needs_input' && allowDegrade && perm.permission === 'auto' && isAcl) {
+      try { await handle?.dispose(); } catch {}
+      if (rec.handle === handle) rec.handle = null;
+      job.handle = null;
+      return { aclFailed: true };
+    }
+    return { aclFailed: false };
+  }
+
+  /**
+   * Create a turn job on a record and start running it.
+   *
+   * Dynamic switching happens here, before the turn runs: tier/effort move the
+   * record's `selectionRef.current` (the model-selection hooks read it per
+   * request) and the sandbox mode is re-appended by the attempt itself.
+   */
+  startPersistentTurn(rec, spec) {
+    const cfg = this.getConfig?.() ?? {};
+    const tier = nonBlank(spec.tier) ?? rec.tier ?? 'flash';
+    if (!TIERS.includes(tier)) {
+      throw new HubRequestError(`unknown tier ${JSON.stringify(tier)}`, { status: 400, code: 'INVALID_TIER' });
+    }
+    const bound = resolveTierBinding(tier, cfg);
+    const provider = nonBlank(spec.provider) ?? bound.provider;
+    const model = nonBlank(spec.model) ?? bound.model;
+    const effort = nonBlank(spec.effort) ?? rec.selectionRef?.current?.reasoningEffort ?? 'max';
+    if (!['off', 'high', 'max'].includes(effort)) {
+      throw new HubRequestError(`unknown effort ${JSON.stringify(effort)}`, { status: 400, code: 'INVALID_EFFORT' });
+    }
+    const perm = resolveWorkerPermission({
+      permission: nonBlank(spec.permission) ?? rec.permission,
+      allowConcurrentCwd: Boolean(spec.allowConcurrentCwd ?? spec.allow_concurrent_cwd),
+      maxPermission: spec.maxPermission ?? spec.max_permission,
+    });
+    const task = typeof spec.task === 'string' ? spec.task : '';
+    if (task.trim() === '') throw new HubRequestError('task is required', { status: 400, code: 'INVALID_PERSISTENT_ARGS' });
+    const source = nonBlank(spec.source) ?? 'api';
+
+    rec.selectionRef.current = {
+      provider,
+      model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    };
+    rec.selectionRef.assembled = undefined;
+    rec.tier = tier;
+    rec.model = model;
+    rec.provider = provider;
+    rec.permission = perm.permission;
+    rec.turns += 1;
+    rec.lastActiveAt = Date.now();
+
+    const job = {
+      id: `hub-${this.nextId++}-${Date.now().toString(36)}`,
+      sessionId: rec.sessionId, persistent: true, turnIndex: rec.turns,
+      tier, model, provider, effort, task, source, cwd: rec.cwd,
+      permission: perm.permission,
+      effective_sandbox_mode: perm.effective_sandbox_mode,
+      preset: rec.preset ?? null,
+      ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}),
+      worktree_path: rec.worktreePath ?? null,
+      isolation: rec.isolation ?? null,
+      degraded_from: rec.degradedFrom ?? null,
+      status: 'running', turn: 0, step: 0, currentTool: null, toolCalls: 0, aclDetected: false,
+      tokens: { input: 0, output: 0, reasoning: 0 },
+      startedAt: new Date().toISOString(), endedAt: null,
+      result: null, error: null, stopReason: null, handle: rec.handle, waiters: [], texts: [],
+    };
+    this.jobs.set(job.id, job);
+    rec.activeJob = job;
+
+    const worktreeFn = spec.createWorktree ?? this.createWorktree ?? createTempWorktree;
+
+    const run = async () => {
+      const first = await this.runPersistentAttempt(rec, job, {
+        attemptCwd: rec.effectiveCwd,
+        attemptSessionId: rec.dshSessionId,
+        presetId: rec.preset ?? undefined,
+        perm,
+        allowDegrade: perm.permission === 'auto',
+        reuseHandle: rec.handle !== null,
+        task,
+      });
+      if (!first.aclFailed || job.status === 'cancelled' || rec.isolation === 'git-worktree') return;
+
+      // Windows ACL failure under `permission: "auto"`: keep serving the same
+      // visible session_id from a temporary git worktree. rec.sessionId and
+      // rec.cwd stay put — they are the caller's identity and comparison base.
+      const firstAclError = job.error;
+      if (!rec.worktreePath) {
+        let wt;
+        try {
+          wt = await worktreeFn({ cwd: rec.cwd, jobId: rec.sessionId });
+        } catch (wtErr) {
+          job.status = 'failed';
+          job.error = firstAclError ? `${firstAclError}; ${wtErr?.message ?? wtErr}` : (wtErr?.message ?? String(wtErr));
+          return;
+        }
+        const worktreeCwd = wt?.cwd ?? wt?.worktreePath;
+        if (!worktreeCwd) {
+          job.status = 'failed';
+          job.error = 'auto worktree fallback failed: missing worktree cwd';
+          return;
+        }
+        rec.worktreePath = wt.worktreePath;
+        rec.effectiveCwd = worktreeCwd;
+      }
+      rec.isolation = 'git-worktree';
+      rec.degradedFrom = perm.effective_sandbox_mode;
+      rec.dshSessionId = `${rec.sessionId}-wt`;
+      if (rec.handle !== null) {
+        try { await rec.handle.dispose(); } catch {}
+        rec.handle = null;
+      }
+      if (job.status === 'cancelled') return;
+      job.worktree_path = rec.worktreePath;
+      job.isolation = rec.isolation;
+      job.degraded_from = rec.degradedFrom;
+      job.status = 'running';
+      job.turn = 0;
+      job.step = 0;
+      job.toolCalls = 0;
+      job.tokens = { input: 0, output: 0, reasoning: 0 };
+      job.error = null;
+      job.result = null;
+      job.stopReason = null;
+      job.reasonDetail = undefined;
+      job.currentTool = null;
+      job.texts = [];
+      this.publish();
+      await this.runPersistentAttempt(rec, job, {
+        attemptCwd: rec.effectiveCwd,
+        attemptSessionId: rec.dshSessionId,
+        presetId: rec.preset ?? undefined,
+        perm,
+        allowDegrade: false,
+        reuseHandle: false,
+        task,
+      });
+    };
+
+    job.promise = run()
+      .catch((err) => {
+        if (job.status === 'running') job.status = 'failed';
+        job.error = job.error ?? (err?.message ?? String(err));
+      })
+      .finally(() => {
+        job.endedAt = new Date().toISOString();
+        job.currentTool = null;
+        rec.lastActiveAt = Date.now();
+        // Only this turn may release the record: a cancelled turn whose
+        // successor already started must not mark the session idle.
+        if (rec.activeJob === job && rec.status === 'running') rec.status = 'idle';
+        this.publish();
+        for (const w of job.waiters.splice(0)) w();
+      });
+    return job;
+  }
+
+  /** Open a NEW persistent session and run its first turn. */
+  async spawnPersistentSession(spec = {}) {
+    const tier = nonBlank(spec.tier) ?? 'flash';
+    if (!TIERS.includes(tier)) throw new Error(`unknown tier "${tier}"`);
+    const effort = nonBlank(spec.effort) ?? 'max';
+    if (!['off', 'high', 'max'].includes(effort)) throw new Error(`unknown effort "${effort}"`);
+    // Validate the permission, ceiling and cwd before touching any runtime.
+    const perm = resolveWorkerPermission({
+      permission: spec.permission,
+      allowConcurrentCwd: Boolean(spec.allowConcurrentCwd ?? spec.allow_concurrent_cwd),
+      maxPermission: spec.maxPermission ?? spec.max_permission,
+    });
+    if (!isAbsoluteCwd(spec.cwd)) throw new Error('cwd must be an absolute path');
+    const cwdPath = canonicalCwd(spec.cwd);
+    const cfg = this.getConfig?.() ?? {};
+    const bound = resolveTierBinding(tier, cfg);
+    const provider = nonBlank(spec.provider) ?? bound.provider;
+    const model = nonBlank(spec.model) ?? bound.model;
+    await this.ctx.get('loader')?.await();
+    const presets = this.ctx.get('agentPresets');
+    const wanted = resolveEffectivePreset({ preset: spec.preset, tier, config: cfg });
+    const presetId = presets === undefined
+      ? undefined
+      : (await presets.resolve(!wanted || wanted === 'default' ? undefined : wanted)).id;
+    const effectivePreset = presetId ?? wanted;
+    // The external identity IS the first underlying session id, so a Hub
+    // restart can map session_id -> persisted log without extra bookkeeping.
+    const sessionId = `session-${randomUUID()}`;
+    const rec = createPersistentSessionRecord({
+      sessionId,
+      cwd: cwdPath,
+      preset: effectivePreset,
+      tier,
+      model,
+      provider,
+      selection: { provider, model, reasoningEffort: effort },
+    });
+    rec.permission = perm.permission;
+    this.persistentSessions.set(sessionId, rec);
+    rec.status = 'running';
+    try {
+      return await this.startPersistentTurn(rec, { ...spec, tier, effort, provider, model, permission: perm.permission });
+    } catch (err) {
+      if (rec.activeJob === null) this.persistentSessions.delete(sessionId);
+      rec.status = 'idle';
+      throw err;
+    }
+  }
+
+  /** Append one turn to an existing persistent session. */
+  async spawnPersistentTurn(spec = {}) {
+    const sessionId = nonBlank(spec.sessionId);
+    if (sessionId === null) {
+      throw new HubRequestError('session_id is required', { status: 400, code: 'INVALID_PERSISTENT_ARGS' });
+    }
+    const rec = this.persistentSessions.get(sessionId) ?? await this.recoverPersistentSession(sessionId, spec);
+    if (rec.status === 'running') {
+      throw new HubRequestError('session is busy', { status: 409, code: 'SESSION_BUSY' });
+    }
+    // cwd is locked; preset is inherited unless the caller names one explicitly.
+    validateSessionTurnBinding({
+      expectedCwd: rec.cwd,
+      actualCwd: spec.cwd,
+      expectedPreset: rec.preset,
+      explicitPreset: spec.preset,
+    });
+    // Reservation is synchronous: a concurrent turn cannot slip in between the
+    // busy check above and this write.
+    rec.status = 'running';
+    try {
+      return await this.startPersistentTurn(rec, spec);
+    } catch (err) {
+      rec.status = 'idle';
+      throw err;
+    }
+  }
+
+  /** Resume one persisted session after a Hub restart, or fail with SESSION_RESUME_FAILED. */
+  async recoverPersistentSession(sessionId, spec = {}) {
+    if (this.closedSessions.has(sessionId)) {
+      throw new HubRequestError('session is closed', { status: 409, code: 'SESSION_CLOSED' });
+    }
+    const inFlight = this.resumeInFlight.get(sessionId);
+    if (inFlight !== undefined) return inFlight;
+    const resume = this.recoverPersistentSessionOnce(sessionId, spec)
+      .finally(() => {
+        if (this.resumeInFlight.get(sessionId) === resume) this.resumeInFlight.delete(sessionId);
+      });
+    this.resumeInFlight.set(sessionId, resume);
+    return resume;
+  }
+
+  async recoverPersistentSessionOnce(sessionId, spec = {}) {
+    const fail = (detail) => new HubRequestError(
+      `cannot resume persistent session ${sessionId}: ${detail}`,
+      { status: 409, code: 'SESSION_RESUME_FAILED' },
+    );
+    if (typeof this.ctx?.agents?.resume !== 'function') throw fail('this hub has no agent resume support');
+    if (!isAbsoluteCwd(spec.cwd)) throw fail('cwd must be an absolute path to resume a session');
+    const cwdPath = canonicalCwd(spec.cwd);
+    const cfg = this.getConfig?.() ?? {};
+    const tier = nonBlank(spec.tier) ?? nonBlank(cfg.default_tier) ?? 'flash';
+    const effort = nonBlank(spec.effort) ?? nonBlank(cfg.default_effort) ?? 'max';
+    const bound = resolveTierBinding(tier, cfg);
+    const provider = nonBlank(spec.provider) ?? bound.provider;
+    const model = nonBlank(spec.model) ?? bound.model;
+    const rec = createPersistentSessionRecord({
+      sessionId,
+      cwd: cwdPath,
+      preset: nonBlank(spec.preset),
+      tier,
+      model,
+      provider,
+      selection: { provider, model, reasoningEffort: effort },
+    });
+    rec.permission = resolveWorkerPermission({
+      permission: spec.permission,
+      allowConcurrentCwd: Boolean(spec.allowConcurrentCwd ?? spec.allow_concurrent_cwd),
+      maxPermission: spec.maxPermission ?? spec.max_permission,
+    }).permission;
+
+    let handle;
+    try {
+      handle = await this.ctx.agents.resume({
+        resumeSessionId: rec.dshSessionId,
+        agentOptions: this.agentOptionsFor(rec),
+        setup: async (agentCtx) => {
+          // The persisted log is the authority on where and under what preset
+          // this session ran; a mismatch means resuming would silently run the
+          // caller's task in the wrong workspace or composition.
+          try {
+            const session = agentCtx?.agent?.session;
+            validateSessionTurnBinding({
+              expectedCwd: session?.header?.cwd,
+              actualCwd: cwdPath,
+              expectedPreset: resolvePersistedSessionPreset(session),
+              explicitPreset: spec.preset,
+            });
+          } catch (err) {
+            throw fail(err?.message ?? String(err));
+          }
+          installModelSelection(agentCtx, rec.selectionRef);
+          const presets = this.ctx.get('agentPresets');
+          const persistedPreset = resolvePersistedSessionPreset(agentCtx?.agent?.session) ?? rec.preset ?? undefined;
+          if (persistedPreset !== undefined && persistedPreset !== null) rec.preset = persistedPreset;
+          if (presets !== undefined && persistedPreset !== undefined && persistedPreset !== null) {
+            await presets.mount(agentCtx, persistedPreset);
+          }
+          const jobOrGetter = () => rec.activeJob;
+          installWorkerQuestionHandoff(agentCtx, jobOrGetter, () => this.publish());
+          this.installRecordEventListeners(rec, agentCtx);
+        },
+      });
+    } catch (err) {
+      if (err instanceof HubRequestError && err.code === 'SESSION_RESUME_FAILED') throw err;
+      throw fail(err?.message ?? String(err));
+    }
+    rec.handle = handle;
+    // Continue the turn counter from the persisted log instead of restarting at 1.
+    rec.turns = countSettledTurns(handle?.agent?.session);
+    rec.preset = resolvePersistedSessionPreset(handle?.agent?.session) ?? rec.preset ?? null;
+    rec.lastActiveAt = Date.now();
+    this.persistentSessions.set(sessionId, rec);
+    return rec;
+  }
+
+  /** Remember a closed id so no later turn (or restart recovery) revives it. */
+  rememberClosedSession(sessionId, reason) {
+    this.closedSessions.set(sessionId, { closedAt: Date.now(), reason: reason ?? null });
+    while (this.closedSessions.size > CLOSED_SESSIONS_LIMIT) {
+      const oldest = this.closedSessions.keys().next();
+      if (oldest.done) break;
+      this.closedSessions.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Destroy one persistent session. The map mutation and the tombstone happen
+   * synchronously (so `reapIdleSessions` can be driven from a test); only the
+   * runtime teardown is awaited.
+   */
+  async closePersistentSession(sessionId, { reason } = {}) {
+    const rec = this.persistentSessions.get(sessionId);
+    let handle = null;
+    if (rec !== undefined) {
+      rec.status = 'closed';
+      rec.lastActiveAt = Date.now();
+      handle = rec.handle;
+      rec.handle = null;
+      const active = rec.activeJob;
+      rec.activeJob = null;
+      this.persistentSessions.delete(sessionId);
+      if (active !== null && active !== undefined && active.status === 'running') {
+        try { active.handle?.agent?.cancel?.({ kind: 'user' }); } catch {}
+        active.status = 'cancelled';
+        active.error = 'session closed';
+      }
+    }
+    this.rememberClosedSession(sessionId, reason);
+    if (handle !== null) { try { await handle.dispose(); } catch {} }
+    this.publish();
+    return { session_id: sessionId, closed: true };
+  }
+
+  listPersistentSessions() {
+    return [...this.persistentSessions.values()].map((rec) => summarizePersistentSession(rec));
+  }
+
+  /**
+   * Close sessions idle past the configured timeout. Never touches a running
+   * session, and an explicit `false` in the panel disables reaping entirely.
+   */
+  reapIdleSessions(now = Date.now()) {
+    const cfg = this.getConfig?.() ?? {};
+    if (cfg?.persistent_session_idle_timeout_enabled === false) return [];
+    const minutes = clampIdleMinutes(cfg?.persistent_session_idle_timeout_minutes);
+    const timeoutMs = minutes * 60_000;
+    const closed = [];
+    for (const rec of [...this.persistentSessions.values()]) {
+      if (rec.status === 'running') continue;
+      const idleSince = typeof rec.lastActiveAt === 'number' ? rec.lastActiveAt : now;
+      if (now - idleSince < timeoutMs) continue;
+      closed.push(rec.sessionId);
+      this.closePersistentSession(rec.sessionId, { reason: 'idle-timeout' }).catch((err) => {
+        this.ctx?.logger?.warn?.(`dsh-crew: idle session close failed: ${err?.message ?? err}`);
+      });
+    }
+    return closed;
+  }
+
   async cancel(id) {
     const job = this.jobs.get(id);
     if (!job) return undefined;
     if (job.status === 'running') {
       job.status = 'cancelled';
       job.error = 'cancelled by request';
-      try { await job.handle?.dispose(); } catch {}
+      const rec = job.persistent === true ? this.persistentSessions.get(job.sessionId) : undefined;
+      if (rec !== undefined) {
+        // A persistent session keeps its handle: cancel only the in-flight turn.
+        try { job.handle?.agent?.cancel?.({ kind: 'user' }); } catch {}
+        if (rec.activeJob === job) { rec.status = 'idle'; rec.lastActiveAt = Date.now(); }
+      } else {
+        try { await job.handle?.dispose(); } catch {}
+      }
       this.publish();
     }
     return job;
   }
 
   async dispose() {
+    if (this.reaperTimer !== null) {
+      clearInterval(this.reaperTimer);
+      this.reaperTimer = null;
+    }
+    for (const rec of [...this.persistentSessions.values()]) {
+      try { await this.closePersistentSession(rec.sessionId, { reason: 'hub-dispose' }); } catch {}
+    }
     for (const job of this.jobs.values()) {
       if (job.status === 'running') { try { await job.handle?.dispose(); } catch {} }
     }
   }
+}
+
+/** Minutes for the idle reaper, clamped to the documented 1..1440 range. */
+function clampIdleMinutes(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_IDLE_TIMEOUT_MINUTES;
+  return Math.min(MAX_IDLE_TIMEOUT_MINUTES, Math.max(1, Math.round(n)));
 }
 
 // ---------- loopback route helpers (pattern from dsh-noema) ----------
@@ -467,6 +1096,18 @@ async function readBody(req, limit = 64 * 1024) {
     if (body.length > limit) throw new Error('payload too large');
   }
   return body.trim() === '' ? {} : JSON.parse(body);
+}
+
+/**
+ * `readBody` for a route whose failures carry a status: a malformed or
+ * oversized body is the caller's mistake (400), not a server fault (500).
+ */
+async function readJsonBody(req, { limit } = {}) {
+  try {
+    return await readBody(req, limit);
+  } catch (err) {
+    throw new HubRequestError(err?.message ?? 'invalid request body', { status: 400, code: 'INVALID_JSON' });
+  }
 }
 
 // ---------- plugin entry ----------
@@ -662,6 +1303,52 @@ export async function apply(ctx) {
           return sendJson(res, 404, { ok: false, error: 'unknown jobs endpoint' });
         } catch (err) {
           return sendJson(res, 400, { ok: false, error: err?.message ?? String(err) });
+        }
+      },
+    }));
+
+    disposers.push(register({
+      kind: 'prefix', path: `${ROUTE_BASE}/sessions`,
+      handler: async (req, res) => {
+        if (!isLoopbackRequest(req)) return sendJson(res, 403, { ok: false, error: 'loopback only' });
+        const url = new URL(req.url, 'http://localhost');
+        const parts = url.pathname.slice(`${ROUTE_BASE}/sessions`.length).split('/').filter(Boolean);
+        try {
+          if (req.method === 'GET' && parts.length === 0) {
+            return sendJson(res, 200, { ok: true, sessions: hub.listPersistentSessions() });
+          }
+          if (req.method === 'POST' && parts.length === 2 && parts[1] === 'turns') {
+            const sessionId = decodeURIComponent(parts[0]);
+            const body = await readJsonBody(req);
+            adoptLang(body?.lang);
+            const job = await hub.spawnPersistentTurn({ ...body, sessionId });
+            return sendJson(res, 200, { ok: true, session_id: job.sessionId, turn_index: job.turnIndex, job: hub.view(job, true) });
+          }
+          if (req.method === 'POST' && parts.length === 2 && parts[1] === 'close') {
+            const sessionId = decodeURIComponent(parts[0]);
+            const body = await readJsonBody(req).catch((err) => {
+              // A close request may legitimately have no body at all; still
+              // refuse genuinely malformed JSON rather than closing silently.
+              if (err instanceof HubRequestError && err.code === 'INVALID_JSON') throw err;
+              return {};
+            });
+            adoptLang(body?.lang);
+            const result = await hub.closePersistentSession(sessionId, { reason: body?.reason });
+            return sendJson(res, 200, { ok: true, ...result });
+          }
+          return sendJson(res, 404, { ok: false, error: 'unknown sessions endpoint' });
+        } catch (err) {
+          // A session-level refusal carries its own status and stable code
+          // (SESSION_BUSY / SESSION_CLOSED / SESSION_CWD_MISMATCH / ...), so the
+          // MCP layer can surface it verbatim instead of a generic 500.
+          if (err instanceof HubRequestError) {
+            return sendJson(res, err.status, { ok: false, error: err.message, code: err.code });
+          }
+          // A bad permission/ceiling is the request's fault, not the hub's.
+          if (err?.name === 'PermissionError') {
+            return sendJson(res, 400, { ok: false, error: err.message, code: err.code ?? 'INVALID_PERMISSION' });
+          }
+          return sendJson(res, 500, { ok: false, error: err?.message ?? String(err) });
         }
       },
     }));
