@@ -293,7 +293,7 @@ test('INVALID_PERSISTENT_ARGS when both persistent:true and session_id are passe
       session_id: 'session-abc',
     });
     assert.equal(codeOf(res.payload), 'INVALID_PERSISTENT_ARGS');
-    assert.match(res.text, /cannot be combined/);
+    assert.match(res.text, /never both/);
   } finally {
     await stop();
   }
@@ -351,6 +351,41 @@ test('persistent:false alone is a one-shot dispatch, not a feature-flag error', 
   try {
     const res = await callTool('dsh_run_worker', { task: 'x', persistent: false });
     assert.notEqual(codeOf(res.payload), 'PERSISTENT_SESSIONS_DISABLED');
+  } finally {
+    await stop();
+  }
+});
+
+test('an empty or blank session_id is an argument error, never a silent one-shot fallback', async () => {
+  const { callTool, stop } = await startServer();
+  try {
+    // 1. Flag OFF: an empty session_id is still a persistent-mode request, so the
+    //    feature-flag refusal wins (it is checked before the argument shape).
+    for (const blank of ['', '   ']) {
+      const off = await callTool('dsh_run_worker', { task: 'x', session_id: blank });
+      assert.equal(codeOf(off.payload), 'PERSISTENT_SESSIONS_DISABLED', `session_id=${JSON.stringify(blank)} with the flag off`);
+      const offClose = await callTool('dsh_session_close', { session_id: blank });
+      assert.equal(codeOf(offClose.payload), 'PERSISTENT_SESSIONS_DISABLED', 'close checks the flag before the argument');
+    }
+
+    // 2. Flag ON: a blank id cannot be resumed, so it must be REFUSED — a cold
+    //    one-shot dispatch here would run an unrelated task while the caller
+    //    believes it continued its session.
+    await callTool('dsh_worker_config', { persistent_sessions: true, mode: 'hub' });
+    for (const blank of ['', '   ']) {
+      const res = await callTool('dsh_run_worker', { task: 'x', session_id: blank });
+      assert.equal(codeOf(res.payload), 'INVALID_PERSISTENT_ARGS', `session_id=${JSON.stringify(blank)} must be refused`);
+      assert.equal(res.payload.status, undefined, 'a refusal is not a job view');
+      assert.doesNotMatch(res.text, /"done"/, 'must never come back as a completed dispatch');
+    }
+
+    // 3. `persistent: true` plus a blank session_id is the same contradiction.
+    const both = await callTool('dsh_run_worker', { task: 'x', persistent: true, session_id: '' });
+    assert.equal(codeOf(both.payload), 'INVALID_PERSISTENT_ARGS');
+
+    // 4. A blank id on close, flag on, is an argument error (after the flag check).
+    const closeBlank = await callTool('dsh_session_close', { session_id: '' });
+    assert.equal(codeOf(closeBlank.payload), 'INVALID_PERSISTENT_ARGS');
   } finally {
     await stop();
   }

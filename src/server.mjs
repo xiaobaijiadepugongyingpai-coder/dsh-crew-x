@@ -180,7 +180,7 @@ function dispatchDisabled() {
 // Stable refusal codes, mirrored from the Hub's own vocabulary so a caller can
 // branch on `code` instead of matching English prose.
 const PERSISTENT_SESSIONS_DISABLED = 'persistent sessions are disabled: turn them on with dsh_worker_config({ persistent_sessions: true }) (or the DSH settings panel) and retry. Persistent sessions require the DSH hub.';
-const INVALID_PERSISTENT_ARGS = 'persistent: true opens a NEW session and session_id appends to an existing one, so they cannot be combined in one call: pass persistent: true for the first turn, then only session_id for later turns.';
+const INVALID_PERSISTENT_ARGS = 'invalid persistent arguments: pass EITHER persistent: true for the first turn (which creates the session) OR a non-empty session_id for later turns, never both, and never an empty session_id — an empty id is a resumption request with nothing to resume, so it is refused instead of quietly running a cold one-shot task.';
 const PERSISTENT_CLI_UNSUPPORTED = 'persistent sessions are not supported for external CLI workers (worker=...): those run a one-shot CLI process with no DSH session to reuse. Omit worker= or leave persistent/session_id unset.';
 const PERSISTENT_STANDALONE_UNSUPPORTED = 'persistent sessions need the DSH hub, which is not reachable (this dispatch would fall back to standalone). Start DSH, set mode: "hub" via dsh_worker_config, or use a one-shot dispatch.';
 
@@ -190,26 +190,49 @@ function codedRefusal(message, code) {
 }
 
 /**
- * Is the caller asking for persistent mode at all?
+ * Was a `session_id` argument supplied at all?
  *
- * Only `persistent: true` and a non-blank `session_id` are requests. An
- * explicit `persistent: false` names no persistent mode — it is the documented
- * way to say "one-shot, please" — so it must never fail the feature flag.
+ * Presence, not content: `session_id: ""` is still a caller ASKING to resume a
+ * session, and silently downgrading that to a cold one-shot dispatch would run
+ * an unrelated task while the caller believes it continued its session. The
+ * empty/blank value is therefore an argument error (INVALID_PERSISTENT_ARGS),
+ * never a quiet fallback.
  */
-function persistentRequested({ persistent, sessionId }) {
-  return persistent === true || sessionId !== null;
+function hasSessionIdArg(value) {
+  return value !== undefined && value !== null;
 }
 
-/** First two of the four persistent-mode refusals (feature flag, bad combo). */
-function checkPersistentArgs({ persistent, sessionId }) {
-  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
-  if (persistent === true && sessionId !== null) return codedRefusal(INVALID_PERSISTENT_ARGS, 'INVALID_PERSISTENT_ARGS');
-  return null;
-}
-
-/** `session_id` argument -> trimmed id or null. */
+/** `session_id` argument -> trimmed id, or null when it carries no usable id. */
 function sessionIdArgOf(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
+
+/**
+ * Is the caller asking for persistent mode at all?
+ *
+ * `persistent: true` and ANY supplied `session_id` (= arguments) are requests.
+ * An explicit `persistent: false` names no persistent mode — it is the
+ * documented way to say "one-shot, please" — so it must never fail the feature
+ * flag.
+ */
+function persistentRequested({ persistent, sessionIdArg }) {
+  return persistent === true || hasSessionIdArg(sessionIdArg);
+}
+
+/**
+ * The first two persistent-mode refusals, in their fixed order.
+ *
+ * `sessionIdArg` is the RAW argument (presence matters) and `sessionId` its
+ * normalized form (null when blank), so "supplied but unusable" and "supplied
+ * alongside persistent: true" are both argument errors rather than silent
+ * fallbacks.
+ */
+function checkPersistentArgs({ persistent, sessionIdArg, sessionId }) {
+  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
+  if ((typeof persistent === 'boolean' && hasSessionIdArg(sessionIdArg)) || (hasSessionIdArg(sessionIdArg) && sessionId === null)) {
+    return codedRefusal(INVALID_PERSISTENT_ARGS, 'INVALID_PERSISTENT_ARGS');
+  }
+  return null;
 }
 
 async function resolveMode() {
@@ -243,14 +266,18 @@ server.registerTool('dsh_run_worker', {
   const e = effort ?? sessionConfig.default_effort;
   const timeout = timeout_seconds ?? sessionConfig.default_timeout_seconds;
   const depthLimit = depthLimitNow();
+  // `sessionIdArg` keeps the RAW value so "the caller supplied session_id" (
+  // including "") stays distinguishable from "the caller did not"; `sessionId`
+  // is the usable id or null.
+  const sessionIdArg = session_id;
   const sessionId = sessionIdArgOf(session_id);
 
   // Persistent-mode gatekeeping happens BEFORE any runtime, lock, or CLI
   // process: an impossible request must cost nothing. Order matters and is
-  // fixed: feature flag -> contradictory args -> unsupported backend.
+  // fixed: feature flag -> contradictory/unusable args -> unsupported backend.
   let persistentMode = false;
-  if (persistentRequested({ persistent, sessionId })) {
-    const refused = checkPersistentArgs({ persistent, sessionId });
+  if (persistentRequested({ persistent, sessionIdArg })) {
+    const refused = checkPersistentArgs({ persistent, sessionIdArg, sessionId });
     if (refused) return refused;
     if (worker) return codedRefusal(PERSISTENT_CLI_UNSUPPORTED, 'PERSISTENT_CLI_UNSUPPORTED');
     // Standalone cannot host a session that outlives one turn. `mode: "standalone"`
@@ -663,9 +690,11 @@ server.registerTool('dsh_session_close', {
     session_id: z.string().describe('The session_id a persistent: true dispatch returned'),
   },
 }, async ({ session_id }) => {
+  // Feature flag first: while persistent sessions are off, that is the reason
+  // nothing can be closed, whatever the argument looks like.
+  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
   const sessionId = sessionIdArgOf(session_id);
   if (sessionId === null) return codedRefusal('session_id is required', 'INVALID_PERSISTENT_ARGS');
-  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
   if (!(await hubAvailable())) return codedRefusal(PERSISTENT_STANDALONE_UNSUPPORTED, 'PERSISTENT_STANDALONE_UNSUPPORTED');
   try {
     const result = await hub.closeSession(sessionId);
