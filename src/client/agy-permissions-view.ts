@@ -12,6 +12,7 @@ export const AGY_DISPATCH_PERMISSION_RULES = [
   'mcp(dsh-crew/dsh_run_worker)',
   'mcp(dsh-crew/dsh_spawn_worker)',
   'mcp(dsh-crew/dsh_worker_cancel)',
+  'mcp(dsh-crew/dsh_session_close)',
 ] as const;
 
 export const AGY_ALL_PERMISSION_RULES = [

@@ -155,12 +155,18 @@ export function formatReportMarkdown(job, { summaryMissing } = {}) {
     `- effective_sandbox_mode: ${job?.effective_sandbox_mode ?? 'n/a'}`,
     `- preset: ${job?.preset ?? 'n/a'}`,
     `- cwd: ${job?.cwd ?? 'n/a'}`,
+  ];
+  // Persistent sessions: name the session and the turn so a stored report can
+  // be traced back to the conversation it came from.
+  if (job?.sessionId) lines.push(`- sessionId: ${job.sessionId}`);
+  if (job?.turnIndex != null) lines.push(`- turnIndex: ${job.turnIndex}`);
+  lines.push(
     `- tokens: input=${tokens.input ?? 0}, output=${tokens.output ?? 0}, reasoning=${tokens.reasoning ?? 0}`,
     `- toolCalls: ${job?.toolCalls ?? 0}`,
     `- startedAt: ${job?.startedAt ?? 'n/a'}`,
     `- endedAt: ${job?.endedAt ?? 'n/a'}`,
     `- summary_missing: ${Boolean(summaryMissing)}`,
-  ];
+  );
   if (job?.error) lines.push(`- error: ${job.error}`);
   lines.push('', '## Full Output', '');
   const body = typeof job?.result === 'string' ? job.result : (job?.result == null ? '' : String(job.result));

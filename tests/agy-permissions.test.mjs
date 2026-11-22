@@ -28,6 +28,7 @@ const EXPECTED_DISPATCH_RULES = [
   'mcp(dsh-crew/dsh_run_worker)',
   'mcp(dsh-crew/dsh_spawn_worker)',
   'mcp(dsh-crew/dsh_worker_cancel)',
+  'mcp(dsh-crew/dsh_session_close)',
 ];
 
 const EXPECTED_ALL_RULES = [...EXPECTED_SAFE_RULES, ...EXPECTED_DISPATCH_RULES];
@@ -307,11 +308,11 @@ test('hub POST /_dsh/dsh-crew/install forwards Antigravity permission options in
     assert.equal(rAll.status, 200);
     assert.equal(rAll.json.ok, true);
     assert.equal(rAll.json.permissions.mode, 'all');
-    assert.equal(rAll.json.desktopPermissionsText.split('\\n').length, 7);
+    assert.equal(rAll.json.desktopPermissionsText.split('\\n').length, 8);
 
     const settingsFile = join(${JSON.stringify(childHome)}, '.gemini', 'antigravity-cli', 'settings.json');
     let saved = JSON.parse(readFileSync(settingsFile, 'utf8'));
-    assert.equal(saved.permissions.allow.length, 7);
+    assert.equal(saved.permissions.allow.length, 8);
 
     const rStatus = await callRoute('/_dsh/dsh-crew/install/status', 'GET');
     assert.equal(rStatus.status, 200);

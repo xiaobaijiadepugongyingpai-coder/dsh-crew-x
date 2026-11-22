@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const MARKETPLACE_NAME = 'dsh-crew';
 const PLUGIN_KEY = `dsh-crew@${MARKETPLACE_NAME}`;
-const MCP_TOOLS = ['dsh_run_worker', 'dsh_spawn_worker', 'dsh_worker_status', 'dsh_worker_result', 'dsh_worker_cancel'];
+const MCP_TOOLS = ['dsh_run_worker', 'dsh_spawn_worker', 'dsh_worker_status', 'dsh_worker_result', 'dsh_worker_cancel', 'dsh_session_close'];
 
 function backup(file) {
   if (existsSync(file)) {
@@ -111,6 +111,13 @@ export const GLOBAL_CONFIG_DEFAULTS = {
   preset_pro: 'default',
   // Directory for offloaded large/failed worker reports ('' = <cwd>/.dsh-reports).
   report_dir: '',
+  // Opt-in persistent DSH sessions (hub mode + Antigravity only). Off by
+  // default: a call passing persistent/session_id errors with
+  // PERSISTENT_SESSIONS_DISABLED until this is turned on.
+  persistent_sessions: false,
+  // Hub reaper for idle persistent sessions, tunable from the settings panel.
+  persistent_session_idle_timeout_enabled: true,
+  persistent_session_idle_timeout_minutes: 30,
 };
 
 export function readGlobalConfig() {
@@ -325,6 +332,7 @@ export const AGY_DISPATCH_MCP_TOOLS = Object.freeze([
   'dsh_run_worker',
   'dsh_spawn_worker',
   'dsh_worker_cancel',
+  'dsh_session_close',
 ]);
 
 export const AGY_ALL_MCP_TOOLS = Object.freeze([
