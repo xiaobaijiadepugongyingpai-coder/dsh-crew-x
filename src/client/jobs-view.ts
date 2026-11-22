@@ -372,3 +372,145 @@ export function dueProcProbes(
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in persistent sessions: display helpers for the session id, the per-turn
+// badge and the session grouping of the jobs board. Pure functions of the job
+// snapshot, like the rest of this module.
+
+/** Prefix the hub puts in front of the session UUID ("session-<uuid>"). */
+const SESSION_ID_PREFIX = 'session-';
+/** How many characters of the session body survive into the compact display id. */
+const SESSION_SHORT_LEN = 8;
+
+/**
+ * Compact display id for a persistent session: the `session-` prefix is
+ * dropped and the first 8 characters of what remains are kept
+ * ("session-9f3c1a7e-…" → "9f3c1a7e"). Anything else (another id shape, an
+ * empty value, null/undefined) degrades to the first 8 characters of the raw
+ * string, and an empty input is just ''. Callers must keep the FULL id in a
+ * tooltip/title: this value is for display only and is not an address.
+ */
+export function shortSessionId(id: any): string {
+  const raw = id === null || id === undefined ? '' : String(id);
+  if (raw === '') return '';
+  const body = raw.startsWith(SESSION_ID_PREFIX) ? raw.slice(SESSION_ID_PREFIX.length) : raw;
+  return body.slice(0, SESSION_SHORT_LEN);
+}
+
+/**
+ * Per-turn badge for a persistent session row: "↻ <shortSessionId> #<turn>".
+ * Empty string for everything else, so one-shot rows render exactly as before:
+ * a non-persistent job, a persistent job whose turn index is null/undefined
+ * (the record exists but no turn ran yet) or a job without a session id.
+ * `turnIndex` is tested with `!= null`, never for truthiness — turn 0 is a
+ * legitimate value in the persisted record even though turns start at 1.
+ */
+export function sessionTagOf(job: any): string {
+  if (!job || job.persistent !== true) return '';
+  const turn = job.turnIndex;
+  if (turn === null || turn === undefined) return '';
+  const short = shortSessionId(job.sessionId);
+  if (short === '') return '';
+  return `↻ ${short} #${turn}`;
+}
+
+/** One persistent session's turns, as the board renders them (one block). */
+export interface SessionJobGroup {
+  /** Full session id — the stable React key for the block. */
+  sessionId: string;
+  /** Compact display id (shortSessionId) for the block header. */
+  short: string;
+  /** This session's turns, lowest turn index first (input order as the tiebreak). */
+  turns: any[];
+  /** Highest numeric turn index seen in the block, or null when none carried one. */
+  lastTurnIndex: number | null;
+  /** True when any turn of the block is still running / waiting for input. */
+  active: boolean;
+}
+
+/**
+ * One step of the grouped walk over a job list: a plain row that stays where it
+ * was, or the FIRST turn of a session block — whose remaining turns travel with
+ * it (they are not emitted again).
+ */
+export type SessionGroupedEntry =
+  | { kind: 'loose'; job: any }
+  | { kind: 'session'; session: SessionJobGroup };
+
+/**
+ * Session-grouped view of the jobs board (opt-in persistent sessions). The
+ * board keeps its WPC13 workspace grouping: this runs per workspace group, over
+ * the same rank-ordered slice the panel already splits into running / finished
+ * rows, and it does NOT re-sort that input — the panel's existing ordering
+ * semantics are the input contract.
+ *
+ * Returned shape (deterministic, no timestamps of its own):
+ *   {
+ *     sessions: SessionJobGroup[],            // first-appearance order
+ *     loose:    any[],                        // one-shot rows + persistent rows
+ *                                             //   without a sessionId, input order
+ *     order:    SessionGroupedEntry[],        // one pass over `jobs`: every
+ *                                             //   loose row in place, and each
+ *                                             //   session block once, at the
+ *                                             //   position of its first turn
+ *   }
+ * Insertion order is stable across polls for the same live set: a session block
+ * is anchored to its first-appearing turn and a session's own turns are ordered
+ * by turn index, so a re-poll that merely refreshes fields cannot churn either
+ * the block order or the row order inside a block. React keys must be the
+ * `sessionId` (and the job id inside a block), never the array index.
+ *
+ * Non-job feed entries (kind: "cwd-lock" status rows) are skipped, exactly as
+ * groupJobs skips them.
+ */
+export function groupJobsBySession(jobs: any[]): {
+  sessions: SessionJobGroup[];
+  loose: any[];
+  order: SessionGroupedEntry[];
+} {
+  const bySession = new Map<string, any[]>();
+  const loose: any[] = [];
+  const anchor: Array<{ sessionId: string } | { job: any }> = [];
+  const seenAnchor = new Set<string>();
+  for (const j of jobs ?? []) {
+    if (!j || j.kind === 'cwd-lock') continue;
+    const sid = j.persistent === true && j.sessionId != null && j.sessionId !== ''
+      ? String(j.sessionId)
+      : '';
+    if (sid === '') { loose.push(j); anchor.push({ job: j }); continue; }
+    const list = bySession.get(sid) ?? [];
+    list.push(j);
+    bySession.set(sid, list);
+    if (!seenAnchor.has(sid)) { seenAnchor.add(sid); anchor.push({ sessionId: sid }); }
+  }
+  const turnOf = (j: any): number | null => (typeof j?.turnIndex === 'number' && Number.isFinite(j.turnIndex) ? j.turnIndex : null);
+  const sessions: SessionJobGroup[] = [];
+  const byId = new Map<string, SessionJobGroup>();
+  const order: SessionGroupedEntry[] = [];
+  for (const a of anchor) {
+    if ('job' in a) { order.push({ kind: 'loose', job: a.job }); continue; }
+    const turns = [...(bySession.get(a.sessionId) ?? [])];
+    // Lowest turn index first; rows without a numeric index keep their input
+    // position after the numbered ones (Array.prototype.sort is stable).
+    turns.sort((x, y) => {
+      const tx = turnOf(x); const ty = turnOf(y);
+      if (tx === null && ty === null) return 0;
+      if (tx === null) return 1;
+      if (ty === null) return -1;
+      return tx - ty;
+    });
+    const numeric = turns.map(turnOf).filter((n): n is number => n !== null);
+    const group: SessionJobGroup = {
+      sessionId: a.sessionId,
+      short: shortSessionId(a.sessionId),
+      turns,
+      lastTurnIndex: numeric.length > 0 ? numeric[numeric.length - 1] : null,
+      active: turns.some((t) => t?.status === 'running' || t?.status === 'needs_input'),
+    };
+    sessions.push(group);
+    byId.set(a.sessionId, group);
+    order.push({ kind: 'session', session: group });
+  }
+  return { sessions, loose, order };
+}

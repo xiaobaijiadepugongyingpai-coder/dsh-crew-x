@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 
-import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes } from './jobs-view';
+import { reconcileGhosts, displayJobs, groupJobs, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf, statusInfoOf, ghostPidOf, procBadgeOf, dueProcProbes, groupJobsBySession, sessionTagOf, shortSessionId, timeAgo } from './jobs-view';
 import {
   AGY_ALL_PERMISSION_RULES,
   AGY_SAFE_PERMISSION_RULES,
@@ -229,6 +229,32 @@ const COPY = {
     copyAllBtn: '复制全部 (8)',
     copied: '已复制',
     copyFailed: '复制失败，请手动全选文本框复制',
+    // Opt-in persistent DSH sessions (Batch 4)
+    groupPersistent: '持久会话',
+    cardPersistent: { t: '持久会话（可选）', d: '默认仍然是一次性任务：只有调用方显式传 persistent: true 或 session_id 才会复用同一个 DSH 会话。开启后空闲超时可自动回收，下面的卡片列出当前存活的会话。' },
+    persistentSessions: '启用持久会话',
+    persistentSessionsHint: 'persistent_sessions：允许 dsh_run_worker 传 persistent / session_id，并启用 dsh_session_close。关闭时这些参数一律报 PERSISTENT_SESSIONS_DISABLED。',
+    persistentIdleEnabled: '启用空闲超时自动回收',
+    persistentIdleEnabledHint: 'persistent_session_idle_timeout_enabled：Hub 定期关闭空闲超过阈值的持久会话（正在执行的轮次不会被回收）。',
+    persistentIdleMinutes: '空闲超时（分钟，1..1440）',
+    persistentIdleMinutesHint: 'persistent_session_idle_timeout_minutes：超过该分钟数没有任何轮次的会话会被自动关闭。',
+    persistentIdleInvalid: (min: number, max: number) => `请输入 ${min}..${max} 之间的整数分钟数`,
+    sessionsTitle: '活跃持久会话',
+    sessionsEmpty: '当前没有存活的持久会话。',
+    sessionsLoadFailed: (msg: string) => `无法获取持久会话列表：${msg}`,
+    sessionsRefresh: '刷新会话列表',
+    sessionCol: { id: '会话', cwd: '工作区', tier: '档位 / 模型', turns: '轮数', status: '状态', lastActive: '最后活跃', actions: '' },
+    sessionTurns: (n: number) => `${n} 轮`,
+    sessionStatus: { running: '运行中', idle: '空闲', closed: '已关闭' } as Record<string, string>,
+    sessionWorktreeBadge: 'worktree',
+    sessionWorktreeTip: (path: string, from?: string | null) => `工作区因 Windows ACL 失败降级到临时 Git Worktree：${path}${from ? `（降级自 ${from}）` : ''}`,
+    sessionClose: '关闭',
+    sessionClosing: '关闭中…',
+    sessionCloseConfirm: (id: string) => `确定关闭持久会话 ${id}？其 DSH 上下文会一并销毁，之后无法再追加轮次。`,
+    sessionCloseDone: (id: string) => `已关闭持久会话 ${id}`,
+    sessionCloseFailed: (msg: string) => `关闭失败：${msg}`,
+    sessionTagTip: (id: string, turn: any) => `持久会话 ${id} 的第 ${turn} 轮`,
+    sessionGroupTurns: (n: number) => `${n} 轮`,
   },
   en: {
     label: 'DSH Crew',
@@ -359,6 +385,32 @@ const COPY = {
     copyAllBtn: 'Copy all (8)',
     copied: 'Copied',
     copyFailed: 'Copy failed — select and copy the text box manually',
+    // Opt-in persistent DSH sessions (Batch 4)
+    groupPersistent: 'Persistent sessions',
+    cardPersistent: { t: 'Persistent sessions (opt-in)', d: 'Dispatch stays one-shot by default: only an explicit persistent: true or session_id reuses one DSH session. When enabled, idle sessions can be reaped automatically and the card below lists the live ones.' },
+    persistentSessions: 'Enable persistent sessions',
+    persistentSessionsHint: 'persistent_sessions: allows dsh_run_worker to take persistent / session_id and enables dsh_session_close. While off, those arguments fail with PERSISTENT_SESSIONS_DISABLED.',
+    persistentIdleEnabled: 'Reap idle sessions automatically',
+    persistentIdleEnabledHint: 'persistent_session_idle_timeout_enabled: the hub periodically closes sessions idle past the threshold (a turn that is still running is never reaped).',
+    persistentIdleMinutes: 'Idle timeout (minutes, 1..1440)',
+    persistentIdleMinutesHint: 'persistent_session_idle_timeout_minutes: a session with no turn for this many minutes is closed automatically.',
+    persistentIdleInvalid: (min: number, max: number) => `Enter a whole number of minutes between ${min} and ${max}`,
+    sessionsTitle: 'Active persistent sessions',
+    sessionsEmpty: 'No persistent sessions are alive right now.',
+    sessionsLoadFailed: (msg: string) => `Failed to load the persistent session list: ${msg}`,
+    sessionsRefresh: 'Refresh the session list',
+    sessionCol: { id: 'session', cwd: 'workspace', tier: 'tier / model', turns: 'turns', status: 'status', lastActive: 'last active', actions: '' },
+    sessionTurns: (n: number) => `${n} turn${n === 1 ? '' : 's'}`,
+    sessionStatus: { running: 'running', idle: 'idle', closed: 'closed' } as Record<string, string>,
+    sessionWorktreeBadge: 'worktree',
+    sessionWorktreeTip: (path: string, from?: string | null) => `Workspace degraded to a temporary git worktree after a Windows ACL failure: ${path}${from ? ` (degraded from ${from})` : ''}`,
+    sessionClose: 'Close',
+    sessionClosing: 'closing…',
+    sessionCloseConfirm: (id: string) => `Close persistent session ${id}? Its DSH context is destroyed with it and no further turn can be appended.`,
+    sessionCloseDone: (id: string) => `Closed persistent session ${id}`,
+    sessionCloseFailed: (msg: string) => `Close failed: ${msg}`,
+    sessionTagTip: (id: string, turn: any) => `Turn ${turn} of persistent session ${id}`,
+    sessionGroupTurns: (n: number) => `${n} turn${n === 1 ? '' : 's'}`,
   },
 };
 
@@ -479,6 +531,18 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   const [procProbe, setProcProbe] = useState<Record<string, { at: number; alive: boolean | null }>>({});
   const procProbeAt = useRef<Record<string, number>>({}); // throttle: last attempt per ghost id
   const [killing, setKilling] = useState<Record<string, boolean>>({});
+
+  // Opt-in persistent sessions (Batch 4): the hub's live session pool
+  // (GET /sessions) rides the existing 3s jobs tick instead of a second timer.
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [sessionsError, setSessionsError] = useState('');
+  const [closingSessions, setClosingSessions] = useState<Record<string, boolean>>({});
+  // Idle-timeout minutes: a draft while typing so an out-of-range value is
+  // refused on commit instead of being written to the config file. null = follow
+  // the saved config value.
+  const [idleMinutesDraft, setIdleMinutesDraft] = useState<string | null>(null);
+  const [idleMinutesError, setIdleMinutesError] = useState('');
 
   const [jobsLoaded, setJobsLoaded] = useState(false); // first OK snapshot arrived
   const [hoverTask, setHoverTask] = useState<{ id: string; text: string; right: number; top: number; bottom: number; flip: boolean } | null>(null);
@@ -640,6 +704,70 @@ function WorkersPanel({ ctx }: { ctx: any }) {
     } catch { /* instance restarting */ }
   }, [get, mergeJobs]);
 
+  /**
+   * Persistent-session pool (Batch 4). Never throws: an instance running an
+   * older build (no /sessions route yet), a hub that is restarting or an
+   * offline hub all just surface as an inline error and leave the list as is.
+   */
+  const refreshSessions = useCallback(async () => {
+    try {
+      const r = await get('/sessions');
+      if (r?.ok) {
+        setSessions(Array.isArray(r.sessions) ? r.sessions : []);
+        setSessionsError('');
+      } else {
+        setSessionsError(String(r?.error ?? 'unknown error'));
+      }
+    } catch (e: any) {
+      setSessionsError(String(e?.message ?? e));
+    } finally {
+      setSessionsLoaded(true);
+    }
+  }, [get]);
+
+  /** POST /sessions/:id/close — the hub requires a JSON content-type (415 otherwise). */
+  const closeSession = useCallback(async (sessionId: string) => {
+    if (!window.confirm(copy.sessionCloseConfirm(sessionId))) return;
+    setClosingSessions((s) => ({ ...s, [sessionId]: true }));
+    try {
+      const r = await post(`/sessions/${encodeURIComponent(sessionId)}/close`, { reason: 'panel-close' });
+      if (r?.ok) {
+        setNotice(copy.sessionCloseDone(sessionId));
+        setTimeout(() => setNotice(''), 1800);
+        await refreshSessions();
+      } else {
+        setSessionsError(copy.sessionCloseFailed(String(r?.error ?? 'unknown error')));
+      }
+    } catch (e: any) {
+      setSessionsError(copy.sessionCloseFailed(String(e?.message ?? e)));
+    } finally {
+      setClosingSessions((s) => ({ ...s, [sessionId]: false }));
+    }
+  }, [post, refreshSessions, copy]);
+
+  /** The 1..1440 minute window the hub clamps to; anything else is refused here. */
+  const IDLE_MINUTES_MIN = 1;
+  const IDLE_MINUTES_MAX = 1440;
+  const idleMinutesSaved = (() => {
+    const n = Number(config?.persistent_session_idle_timeout_minutes);
+    return Number.isFinite(n) ? n : 30;
+  })();
+  const commitIdleMinutes = () => {
+    if (idleMinutesDraft === null) return;
+    const raw = idleMinutesDraft.trim();
+    setIdleMinutesDraft(null);
+    if (raw === '') { setIdleMinutesError(''); return; } // empty draft = revert
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < IDLE_MINUTES_MIN || n > IDLE_MINUTES_MAX) {
+      setIdleMinutesError(copy.persistentIdleInvalid(IDLE_MINUTES_MIN, IDLE_MINUTES_MAX));
+      return;
+    }
+    setIdleMinutesError('');
+    if (n === idleMinutesSaved) return;
+    setConfig((c: any) => ({ ...c, persistent_session_idle_timeout_minutes: n }));
+    applyPatch({ persistent_session_idle_timeout_minutes: n });
+  };
+
   const refreshProviders = useCallback(async () => {
     const seq = ++providersSeqRef.current;
     providersAbortRef.current?.abort();
@@ -671,11 +799,17 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   useEffect(() => {
     void refreshAll();
     void refreshProviders();
-    const timer = setInterval(() => { void get('/jobs').then((j) => { if (j.ok) mergeJobs(j.jobs ?? []); }).catch(() => {}); }, 3000);
+    void refreshSessions();
+    // One shared tick: the jobs feed and the persistent-session pool refresh
+    // together, so the panel never runs two independent polling timers.
+    const timer = setInterval(() => {
+      void get('/jobs').then((j) => { if (j.ok) mergeJobs(j.jobs ?? []); }).catch(() => {});
+      void refreshSessions();
+    }, 3000);
     return () => {
       clearInterval(timer);
     };
-  }, [refreshAll, refreshProviders, get, mergeJobs]);
+  }, [refreshAll, refreshProviders, refreshSessions, get, mergeJobs]);
 
   useEffect(() => () => {
     providersSeqRef.current += 1;
@@ -993,11 +1127,13 @@ function WorkersPanel({ ctx }: { ctx: any }) {
   const groups = groupJobs(rows);
   const locks = workspaceLocks(rows);
   /** One job row: status (with orphan/stall labeling), progress, tokens and a
-   * single-line task cell (WPC13). */
+   * single-line task cell (WPC13). A persistent turn also carries its
+   * "↻ <session> #<turn>" badge; one-shot rows are unchanged. */
   const renderJobRow = (job: any) => {
     const ghostRow = !!ghosts[job.id] && !jobs.some((l) => l?.id === job.id);
     const info = statusInfoOf(job, copy);
     const pb = procBadgeOf(job, procProbe[job.id]);
+    const sessionTag = sessionTagOf(job);
     return (
       <tr key={job.id} style={job.status === 'orphaned' ? { background: 'rgba(240,136,62,0.05)' } : undefined}>
         <td style={{ ...S.tight, ...S.mono }} title={job.origin ? `${job.id} · ${job.origin}` : job.id}>{String(job.id).replace(/-[a-z0-9]+$/, '')}</td>
@@ -1032,6 +1168,12 @@ function WorkersPanel({ ctx }: { ctx: any }) {
           onMouseLeave={() => setHoverTask(null)}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            {sessionTag !== '' && (
+              <span title={copy.sessionTagTip(job.sessionId, job.turnIndex)}
+                style={{ flexShrink: 0, ...S.mono, fontSize: 11, color: '#4a9eff', whiteSpace: 'nowrap', padding: '0 6px', borderRadius: 99, border: '1px solid rgba(74,158,255,0.5)' }}>
+                {sessionTag}
+              </span>
+            )}
             <div style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', lineHeight: 1.45, fontSize: 12.5 }}>
               {job.task}
               {job.status === 'needs_input' && <div style={{ whiteSpace: 'normal', color: '#d29922', marginTop: 4 }}>{(job.questions ?? []).map((q: any) => q.question).join(' · ')}</div>}
@@ -1276,8 +1418,35 @@ function WorkersPanel({ ctx }: { ctx: any }) {
           </div>
         </>), false)}
 
+        <div style={S.group}>{copy.groupPersistent}</div>
+        {block(copy.cardPersistent, (<>
+          <label style={{ ...S.field, flexDirection: 'row' as const, alignItems: 'center', gap: 6 }} title={copy.persistentSessionsHint}>
+            <input type="checkbox" checked={!!config.persistent_sessions}
+              onChange={(e) => field('persistent_sessions', e.target.checked)} />
+            <span style={{ fontSize: 12.5 }}>{copy.persistentSessions}</span>
+          </label>
+          <label style={{ ...S.field, flexDirection: 'row' as const, alignItems: 'center', gap: 6 }} title={copy.persistentIdleEnabledHint}>
+            <input type="checkbox" checked={config.persistent_session_idle_timeout_enabled !== false}
+              onChange={(e) => field('persistent_session_idle_timeout_enabled', e.target.checked)} />
+            <span style={{ fontSize: 12.5 }}>{copy.persistentIdleEnabled}</span>
+          </label>
+          <label style={S.field} title={copy.persistentIdleMinutesHint}>
+            <span style={S.fieldLabel}>{copy.persistentIdleMinutes}</span>
+            <input style={{ ...S.input, width: '100%', boxSizing: 'border-box' as const, ...S.mono }}
+              type="number" min={IDLE_MINUTES_MIN} max={IDLE_MINUTES_MAX} step={1}
+              value={idleMinutesDraft ?? String(idleMinutesSaved)}
+              onChange={(e) => { setIdleMinutesDraft(e.target.value); setIdleMinutesError(''); }}
+              onBlur={commitIdleMinutes}
+              onKeyDown={(e: any) => {
+                if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+                if (e.key === 'Escape') { e.preventDefault(); setIdleMinutesDraft(null); setIdleMinutesError(''); }
+              }} />
+            {idleMinutesError !== '' && (
+              <span style={{ fontSize: 11.5, color: '#f85149' }}>{idleMinutesError}</span>
+            )}
+          </label>
+        </>), false)}
 
-        <div style={S.group}>{copy.groupRuntime}</div>
         {block(copy.cardRuntime, (<>
           <div style={S.blockGrid}>
             <label style={S.field}><span style={S.fieldLabel}>{copy.mode}</span>
@@ -1457,6 +1626,72 @@ function WorkersPanel({ ctx }: { ctx: any }) {
 
       {notice !== '' && <div style={{ fontSize: 12, opacity: 0.8, whiteSpace: 'pre-wrap' }}>{notice}</div>}
 
+      {/* Active persistent sessions (Batch 4): the hub's live session pool. */}
+      <div style={{ ...S.card, padding: '9px 12px', gap: 8 }}>
+        <span style={{ fontWeight: 600, fontSize: 13 }}>{copy.sessionsTitle}</span>
+        <span style={{ ...S.chip(sessions.length > 0) }}>{sessions.length}</span>
+        <span style={{ flex: 1 }} />
+        <button type="button" style={{ ...S.btn, padding: '2px 9px', fontSize: 11.5 }} title={copy.sessionsRefresh}
+          onClick={() => { void refreshSessions(); }}>↻</button>
+      </div>
+      {sessionsError !== '' && (
+        <div style={{ fontSize: 11.5, color: '#f85149' }}>{copy.sessionsLoadFailed(sessionsError)}</div>
+      )}
+      {sessions.length === 0 ? (
+        <div style={{ fontSize: 12, opacity: 0.55 }}>{sessionsLoaded ? copy.sessionsEmpty : copy.working}</div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ borderCollapse: 'collapse', width: '100%', tableLayout: 'fixed', minWidth: 720 }}>
+            <thead><tr>
+              {[copy.sessionCol.id, copy.sessionCol.cwd, copy.sessionCol.tier, copy.sessionCol.turns,
+                copy.sessionCol.status, copy.sessionCol.lastActive, copy.sessionCol.actions].map((h, i) => (
+                <th key={i} style={{ ...S.tight, fontSize: 11, opacity: 0.55, fontWeight: 500 }}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {sessions.map((sn: any) => {
+                const sid = String(sn?.session_id ?? '');
+                const worktree = sn?.isolation === 'git-worktree';
+                const stLabel = copy.sessionStatus[String(sn?.status ?? '')] ?? String(sn?.status ?? '?');
+                return (
+                  <tr key={sid || String(sn?.cwd ?? '')}>
+                    <td style={{ ...S.tight, ...S.mono }} title={sid}>{shortSessionId(sid)}</td>
+                    <td style={{ ...S.tight, ...S.mono }} title={String(sn?.cwd ?? '')}>{abbrevPath(sn?.cwd)}</td>
+                    <td style={{ ...S.tight, ...S.mono }} title={[sn?.provider, sn?.preset].filter(Boolean).join(' · ') || undefined}>
+                      {sn?.tier ?? '?'}{sn?.model ? ` / ${sn.model}` : ''}
+                    </td>
+                    <td style={{ ...S.tight, ...S.mono }}>{copy.sessionTurns(Number(sn?.turns ?? 0))}</td>
+                    <td style={S.tight}>
+                      <span style={{ color: sn?.status === 'running' ? '#4a9eff' : sn?.status === 'closed' ? '#f85149' : '#3fb950', fontSize: 11 }}>
+                        ● {stLabel}
+                      </span>
+                    </td>
+                    <td style={{ ...S.tight, ...S.mono }} title={String(sn?.last_active_iso ?? '')}>
+                      {sn?.last_active_iso ? timeAgo(sn.last_active_iso) : '-'}
+                    </td>
+                    <td style={{ ...S.tight, whiteSpace: 'normal' as const }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' as const }}>
+                        {worktree && (
+                          <span title={copy.sessionWorktreeTip(String(sn?.worktree_path ?? ''), sn?.degraded_from)}
+                            style={{ fontSize: 11, padding: '0 7px', borderRadius: 99, border: '1px solid rgba(210,153,34,0.5)', color: '#d29922', whiteSpace: 'nowrap' }}>
+                            {copy.sessionWorktreeBadge}
+                          </span>
+                        )}
+                        <button type="button" disabled={!!closingSessions[sid]}
+                          title={copy.sessionCloseConfirm(sid)} style={{ ...S.btn, padding: '1px 8px', fontSize: 11.5, opacity: closingSessions[sid] ? 0.5 : 0.9 }}
+                          onClick={() => { void closeSession(sid); }}>
+                          {closingSessions[sid] ? copy.sessionClosing : copy.sessionClose}
+                        </button>
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div style={S.section}>{copy.jobs}</div>
       {!jobsLoaded || groups.length === 0 ? (
         <div style={{ opacity: 0.55 }}>{copy.empty}</div>
@@ -1499,12 +1734,29 @@ function WorkersPanel({ ctx }: { ctx: any }) {
 }
 
 /**
+ * Re-order one slice of a workspace group so the turns of a persistent session
+ * sit together (lowest turn index first) while every non-persistent row keeps
+ * exactly its current position. `groupJobs` (and its per-status ordering) stays
+ * untouched: `groupJobsBySession` only anchors each session block to the
+ * position of its first turn and never re-sorts loose rows, so a board without
+ * persistent turns is byte-for-byte the previous rendering.
+ */
+function sessionContiguous(list: any[]): any[] {
+  return groupJobsBySession(list).order.flatMap((e) => (e.kind === 'loose' ? [e.job] : e.session.turns));
+}
+
+/**
  * One workspace group on the jobs board (WPC13): a header row — directory
  * basename (bold), abbreviated full path, job count and an optional lock
  * badge (🔒 backend · 7m42s) whose tooltip carries the old held-workspaces
  * explanation — followed by that workspace's rows, with settled jobs tucked
  * behind a per-group "Finished (n)" fold. Group and fold collapse states are
  * remembered per workspace in localStorage.
+ *
+ * Batch 4: turns of one persistent session are pulled next to each other and a
+ * sub-header (↻ <short id> · N turns) is emitted above the block. Session ids
+ * are the React keys of those sub-headers, never the row index, so a re-poll
+ * that only refreshes fields cannot remount a block.
  */
 function WorkspaceGroup({ group, locks, copy, renderRow }: {
   group: { cwd: string | null; jobs: any[] };
@@ -1516,8 +1768,33 @@ function WorkspaceGroup({ group, locks, copy, renderRow }: {
   const [collapsed, toggle] = useWorkspaceCollapse(wsKey);
   // Settled rows start folded away; the choice is remembered per workspace.
   const [finishedCollapsed, toggleFinished] = useCollapseSection(`finished-jobs.${wsKey}`, true);
-  const active = group.jobs.filter((j) => j.status === 'running' || j.status === 'orphaned' || j.status === 'needs_input');
-  const finished = group.jobs.filter((j) => j.status !== 'running' && j.status !== 'orphaned' && j.status !== 'needs_input');
+  const active = sessionContiguous(group.jobs.filter((j) => j.status === 'running' || j.status === 'orphaned' || j.status === 'needs_input'));
+  const finished = sessionContiguous(group.jobs.filter((j) => j.status !== 'running' && j.status !== 'orphaned' && j.status !== 'needs_input'));
+  /** Rows for one slice, with a sub-header above each persistent session block. */
+  const renderSlice = (list: any[]) => {
+    const bySession = groupJobsBySession(list);
+    const sessionById = new Map(bySession.sessions.map((s) => [s.sessionId, s]));
+    const emitted = new Set<string>();
+    return list.flatMap((job: any) => {
+      const sid = job?.persistent === true && job?.sessionId ? String(job.sessionId) : '';
+      if (sid === '') return [renderRow(job)];
+      const block = sessionById.get(sid);
+      if (!block || emitted.has(sid)) return [];
+      emitted.add(sid);
+      return [
+        <tr key={`session-head:${sid}`}>
+          <td colSpan={7} style={{ ...S.tight, fontSize: 11.5, padding: '5px 10px 5px 0', color: '#4a9eff' }}
+            title={sid}>
+            <span style={{ ...S.mono, whiteSpace: 'nowrap' }}>
+              ↻ {block.short} · {copy.sessionGroupTurns(block.turns.length)}
+            </span>
+            {block.active && <span style={{ marginLeft: 8, color: '#d29922' }}>{copy.statusRunning}</span>}
+          </td>
+        </tr>,
+        ...block.turns.map(renderRow),
+      ];
+    });
+  };
   const badge = lockBadgeOf(locks, group.cwd, copy);
   return (<>
     <tr>
@@ -1546,7 +1823,7 @@ function WorkspaceGroup({ group, locks, copy, renderRow }: {
       </td>
     </tr>
     {!collapsed && (<>
-      {active.map(renderRow)}
+      {renderSlice(active)}
       {finished.length > 0 && (
         <tr>
           <td colSpan={7} role="button" tabIndex={0} aria-expanded={!finishedCollapsed}
@@ -1559,7 +1836,7 @@ function WorkspaceGroup({ group, locks, copy, renderRow }: {
           </td>
         </tr>
       )}
-      {finished.length > 0 && !finishedCollapsed && finished.map(renderRow)}
+      {finished.length > 0 && !finishedCollapsed && renderSlice(finished)}
     </>)}
   </>);
 }

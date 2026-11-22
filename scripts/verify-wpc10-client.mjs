@@ -6,6 +6,10 @@
 // group), per-group finished counts, lock-badge derivation (kind:"cwd-lock"
 // entries + running-job fallback) and the group-header path helpers
 // (basename, ~-substitution + middle ellipsis, stable storage key).
+// Batch 4 additions on top: the opt-in persistent-session display helpers —
+// compact session id (shortSessionId), the per-turn badge (sessionTagOf,
+// persistent and non-persistent cases) and the per-session grouping of the
+// jobs board (groupJobsBySession, grouping + stable ordering).
 // No browser needed.
 //
 //   node scripts/verify-wpc10-client.mjs
@@ -35,6 +39,7 @@ try {
     reconcileGhosts, displayJobs, heldWorkspaces, shortPath, chainText, statusInfoOf,
     groupJobs, finishedCountOf, workspaceKey, basenameOf, abbrevPath, workspaceLocks, lockBadgeOf,
     ghostPidOf, procBadgeOf, dueProcProbes, PROC_PROBE_INTERVAL_MS,
+    shortSessionId, sessionTagOf, groupJobsBySession,
     ORPHAN_MISSES, GHOST_CAP,
   } = mod;
 
@@ -228,6 +233,75 @@ try {
   gp = reconcileGhosts([], gp, now + 6000);
   check('orphaned tombstone keeps the recorded pid',
     gp['job-1-x']?.job?.pid === 4242 && gp['job-1-x']?.job?.status === 'orphaned');
+
+  // 20. Opt-in persistent sessions: the compact display id.
+  check('shortSessionId strips the session- prefix and keeps 8 chars',
+    shortSessionId('session-9f3c1a7e-1111-2222-3333-444455556666') === '9f3c1a7e');
+  check('shortSessionId degrades defensively on null/empty/short/unknown shapes',
+    shortSessionId(null) === '' && shortSessionId(undefined) === '' && shortSessionId('') === ''
+    && shortSessionId('  ') !== '' && shortSessionId('abc') === 'abc'
+    && shortSessionId('session-') === '' && shortSessionId(12345) === '12345');
+
+  // 21. Opt-in persistent sessions: the per-turn badge, both cases.
+  const persistentTurn = job({
+    id: 'hub-turn-2', persistent: true, sessionId: 'session-9f3c1a7e-1111-2222-3333-444455556666',
+    turnIndex: 2, status: 'done', cwd: '/w/p',
+  });
+  check('sessionTagOf renders the persistent badge as ↻ <short> #<turn>',
+    sessionTagOf(persistentTurn) === '↻ 9f3c1a7e #2');
+  check('sessionTagOf keeps turnIndex 0 (never truthiness-tested)',
+    sessionTagOf(job({ persistent: true, sessionId: 'session-abcdef01-x', turnIndex: 0 })) === '↻ abcdef01 #0');
+  check('sessionTagOf returns "" for a non-persistent job',
+    sessionTagOf(job()) === '' && sessionTagOf(job({ sessionId: 'session-9f3c1a7e-x', turnIndex: 3 })) === '');
+  check('sessionTagOf returns "" without a usable turn index or session id',
+    sessionTagOf(job({ persistent: true, sessionId: 'session-9f3c1a7e-x' })) === ''
+    && sessionTagOf(job({ persistent: true, sessionId: 'session-9f3c1a7e-x', turnIndex: null })) === ''
+    && sessionTagOf(job({ persistent: true, turnIndex: 1 })) === ''
+    && sessionTagOf(null) === '');
+
+  // 22. Opt-in persistent sessions: per-session grouping, insertion order stable.
+  const SID_A = 'session-aaaaaaaa-0000-0000-0000-000000000001';
+  const SID_B = 'session-bbbbbbbb-0000-0000-0000-000000000002';
+  const groupedRows = [
+    job({ id: 'loose-1', cwd: '/w/g' }),
+    job({ id: 'a2', persistent: true, sessionId: SID_A, turnIndex: 2, status: 'done', cwd: '/w/g' }),
+    job({ id: 'b1', persistent: true, sessionId: SID_B, turnIndex: 1, status: 'done', cwd: '/w/g' }),
+    job({ id: 'a1', persistent: true, sessionId: SID_A, turnIndex: 1, status: 'done', cwd: '/w/g' }),
+    job({ id: 'loose-2', cwd: '/w/g' }),
+    { kind: 'cwd-lock', id: 'cwd-lock-9', cwd: '/w/l', holder: {} },
+  ];
+  const gs = groupJobsBySession(groupedRows);
+  check('groupJobsBySession groups turns of one session together',
+    gs.sessions.length === 2 && gs.sessions[0].sessionId === SID_A && gs.sessions[0].turns.map((j) => j.id).join(',') === 'a1,a2');
+  check('groupJobsBySession orders each session block by turn index',
+    gs.sessions[1].sessionId === SID_B && gs.sessions[1].turns.length === 1 && gs.sessions[1].lastTurnIndex === 1);
+  check('groupJobsBySession keeps non-persistent rows loose, in input order',
+    gs.loose.map((j) => j.id).join(',') === 'loose-1,loose-2');
+  check('groupJobsBySession exposes the compact id and the active flag',
+    gs.sessions[0].short === 'aaaaaaaa' && gs.sessions.every((s) => s.active === false));
+  check('groupJobsBySession order anchors a block at its first turn',
+    gs.order.map((e) => (e.kind === 'loose' ? e.job.id : 'S:' + e.session.sessionId)).join(',')
+    === `loose-1,S:${SID_A},S:${SID_B},loose-2`);
+  check('groupJobsBySession skips kind:"cwd-lock" feed entries',
+    gs.order.some((e) => e.kind === 'loose' && e.job?.kind === 'cwd-lock') === false);
+
+  // 23. Stable ordering across polls: refreshed timestamps/statuses must not
+  //     churn block order, row order or loose positions.
+  const repolled = groupedRows.map((j) => (j?.kind === 'cwd-lock' ? j : { ...j, startedAt: new Date(now - 12345).toISOString() }));
+  const gs2 = groupJobsBySession(repolled);
+  check('groupJobsBySession keeps insertion order stable across a re-poll',
+    gs2.sessions.map((s) => s.sessionId).join(',') === gs.sessions.map((s) => s.sessionId).join(',')
+    && gs2.sessions.map((s) => s.turns.map((j) => j.id).join(',')).join('|')
+      === gs.sessions.map((s) => s.turns.map((j) => j.id).join(',')).join('|')
+    && gs2.loose.map((j) => j.id).join(',') === gs.loose.map((j) => j.id).join(','));
+  check('groupJobsBySession marks a block active while a turn runs',
+    groupJobsBySession([job({ id: 'r1', persistent: true, sessionId: SID_A, turnIndex: 1 })]).sessions[0].active === true);
+
+  // 24. Non-persistent board is unchanged: no session blocks, every row loose.
+  const plain = groupJobsBySession([job({ id: 'p1' }), job({ id: 'p2', status: 'done' })]);
+  check('groupJobsBySession leaves a one-shot board untouched',
+    plain.sessions.length === 0 && plain.loose.length === 2
+    && plain.order.every((e) => e.kind === 'loose'));
 
   console.log('  (ORPHAN_MISSES = ' + ORPHAN_MISSES + ', GHOST_CAP = ' + GHOST_CAP + ')');
   if (failures > 0) { console.error('\nWPC10 CLIENT CHECKS FAILED: ' + failures); process.exit(1); }
