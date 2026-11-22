@@ -236,6 +236,14 @@ export function createHubClient({
     if (!res.ok || !body || typeof body !== 'object' || body.ok === false) {
       const err = new Error(body?.error ?? `hub request failed (${res.status})`);
       err.status = res.status;
+      // A refusal carries a stable machine-readable code next to its prose
+      // (SESSION_BUSY / SESSION_CLOSED / SESSION_CWD_MISMATCH /
+      // SESSION_PRESET_MISMATCH / SESSION_RESUME_FAILED / INVALID_PERSISTENT_ARGS
+      // / PERSISTENT_SESSIONS_DISABLED ...), so callers can branch on the reason
+      // instead of matching English. Only attached when the hub actually sent
+      // one: `err.code` is otherwise undefined, never a stale/guessed value.
+      const code = body && typeof body === 'object' ? body.code : undefined;
+      if (code !== undefined) err.code = code;
       throw err;
     }
     return body;
@@ -288,6 +296,23 @@ export function createHubClient({
       }
     },
     cancel: (id) => call(`/jobs/${id}/cancel`, { method: 'POST' }).then((b) => b.job),
+    // ---------- persistent sessions (opt-in) ----------
+    // The hub owns the session pool; these three calls are the whole MCP-side
+    // surface. `sessionTurn` starts ONE more turn on an existing session and
+    // returns immediately with the job view (the turn itself runs in the hub),
+    // so the caller waits through the ordinary `get(id, waitSeconds)` path.
+    // The session id is path-encoded: it is opaque hub data, not a slug.
+    sessionTurn: (sessionId, spec) => call(`/sessions/${encodeURIComponent(sessionId)}/turns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(spec ?? {}),
+    }).then((b) => b.job),
+    listSessions: () => call('/sessions').then((b) => b.sessions ?? []),
+    closeSession: (sessionId) => call(`/sessions/${encodeURIComponent(sessionId)}/close`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(({ ok, ...rest }) => rest),
   };
 
   const getActiveHubUrl = () => activeBase;

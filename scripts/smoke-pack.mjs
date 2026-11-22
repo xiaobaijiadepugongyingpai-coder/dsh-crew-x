@@ -48,6 +48,7 @@ const EXPECTED_TOOLS = [
   'dsh_worker_status',
   'dsh_worker_result',
   'dsh_worker_cancel',
+  'dsh_session_close',
 ].sort();
 
 const HOST_RUNTIME_PACKAGES = [

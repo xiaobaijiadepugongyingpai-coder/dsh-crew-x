@@ -52,6 +52,9 @@ const sessionConfig = {
   pro_model: globalDefaults.pro_model ?? '',
   // WPC9: max worker→worker nesting depth before a dispatch is refused.
   origin_depth_limit: DEFAULT_ORIGIN_DEPTH_LIMIT,
+  // Opt-in persistent DSH sessions (hub mode only). Off unless the global
+  // config turns it on, so an existing install keeps its one-shot behaviour.
+  persistent_sessions: globalDefaults.persistent_sessions ?? false,
 };
 
 /** The {provider, model} this session dispatches `tier` to. */
@@ -172,6 +175,43 @@ function dispatchDisabled() {
   });
 }
 
+// ---------- opt-in persistent sessions (hub mode only) ----------
+
+// Stable refusal codes, mirrored from the Hub's own vocabulary so a caller can
+// branch on `code` instead of matching English prose.
+const PERSISTENT_SESSIONS_DISABLED = 'persistent sessions are disabled: turn them on with dsh_worker_config({ persistent_sessions: true }) (or the DSH settings panel) and retry. Persistent sessions require the DSH hub.';
+const INVALID_PERSISTENT_ARGS = 'persistent: true opens a NEW session and session_id appends to an existing one, so they cannot be combined in one call: pass persistent: true for the first turn, then only session_id for later turns.';
+const PERSISTENT_CLI_UNSUPPORTED = 'persistent sessions are not supported for external CLI workers (worker=...): those run a one-shot CLI process with no DSH session to reuse. Omit worker= or leave persistent/session_id unset.';
+const PERSISTENT_STANDALONE_UNSUPPORTED = 'persistent sessions need the DSH hub, which is not reachable (this dispatch would fall back to standalone). Start DSH, set mode: "hub" via dsh_worker_config, or use a one-shot dispatch.';
+
+/** A refusal that carries its machine-readable code next to the prose. */
+function codedRefusal(message, code) {
+  return text({ error: message, code });
+}
+
+/**
+ * Is the caller asking for persistent mode at all?
+ *
+ * Only `persistent: true` and a non-blank `session_id` are requests. An
+ * explicit `persistent: false` names no persistent mode — it is the documented
+ * way to say "one-shot, please" — so it must never fail the feature flag.
+ */
+function persistentRequested({ persistent, sessionId }) {
+  return persistent === true || sessionId !== null;
+}
+
+/** First two of the four persistent-mode refusals (feature flag, bad combo). */
+function checkPersistentArgs({ persistent, sessionId }) {
+  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
+  if (persistent === true && sessionId !== null) return codedRefusal(INVALID_PERSISTENT_ARGS, 'INVALID_PERSISTENT_ARGS');
+  return null;
+}
+
+/** `session_id` argument -> trimmed id or null. */
+function sessionIdArgOf(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
+
 async function resolveMode() {
   if (sessionConfig.mode === 'standalone') return 'standalone';
   const up = await hubAvailable();
@@ -181,7 +221,7 @@ async function resolveMode() {
 
 server.registerTool('dsh_run_worker', {
   title: 'Run DSH worker (blocking)',
-  description: 'Run one DSH (DeepSeek Harness) coding agent task and block until it finishes. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends a fixed summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED) and parses { summary, summary_missing } from the final output. Outputs exceeding inline_limit (default 1500 output tokens / 4000 chars) or non-done jobs are offloaded to report_path (default <cwd>/.dsh-reports/ with .gitignore updated, or ~/.config/dsh-crew/reports fallback when unwritable) and omit the full result unless full_reply=true. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks.',
+  description: 'Run one DSH (DeepSeek Harness) coding agent task and block until it finishes. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends a fixed summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED) and parses { summary, summary_missing } from the final output. Outputs exceeding inline_limit (default 1500 output tokens / 4000 chars) or non-done jobs are offloaded to report_path (default <cwd>/.dsh-reports/ with .gitignore updated, or ~/.config/dsh-crew/reports fallback when unwritable) and omit the full result unless full_reply=true. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks. OPT-IN PERSISTENT SESSIONS (hub mode, requires persistent_sessions enabled): pass persistent: true to start a reusable DSH session and get its session_id back, then pass that session_id on later calls to append turns to the SAME session with its conversation history intact. Persistent turns keep their locked cwd and agent preset (omit preset after the first turn to inherit it), may switch tier/effort/permission per turn, and never auto-escalate flash -> pro. Close a session with dsh_session_close when done.',
   inputSchema: {
     task: z.string().describe('Full task description for the worker, self-contained'),
     tier: tierSchema,
@@ -194,13 +234,32 @@ server.registerTool('dsh_run_worker', {
     preset: presetSchema,
     inline_limit: inlineLimitSchema,
     full_reply: fullReplySchema,
+    persistent: z.boolean().optional().describe('Opt-in persistent sessions (hub mode only, requires persistent_sessions enabled). true starts a NEW reusable DSH session with this task as its first turn and returns session_id in the result. Later turns pass that session_id instead, so the worker keeps its full conversation context. Never combine with session_id. Ignored argument for external CLI workers (worker=...), which are refused.'),
+    session_id: z.string().optional().describe('Append this task as the NEXT turn on an existing persistent session (the session_id a previous persistent: true call returned). The session keeps its locked cwd and agent preset: pass the same cwd, and omit preset unless it is the identical one you created the session with. A busy session fails with SESSION_BUSY; a closed one with SESSION_CLOSED. Never combine with persistent: true.'),
   },
-}, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd, permission, preset, inline_limit, full_reply }) => {
+}, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd, permission, preset, inline_limit, full_reply, persistent, session_id }) => {
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const e = effort ?? sessionConfig.default_effort;
   const timeout = timeout_seconds ?? sessionConfig.default_timeout_seconds;
   const depthLimit = depthLimitNow();
+  const sessionId = sessionIdArgOf(session_id);
+
+  // Persistent-mode gatekeeping happens BEFORE any runtime, lock, or CLI
+  // process: an impossible request must cost nothing. Order matters and is
+  // fixed: feature flag -> contradictory args -> unsupported backend.
+  let persistentMode = false;
+  if (persistentRequested({ persistent, sessionId })) {
+    const refused = checkPersistentArgs({ persistent, sessionId });
+    if (refused) return refused;
+    if (worker) return codedRefusal(PERSISTENT_CLI_UNSUPPORTED, 'PERSISTENT_CLI_UNSUPPORTED');
+    // Standalone cannot host a session that outlives one turn. `mode: "standalone"`
+    // is a decision; an unreachable hub is discovered here, before the spawn.
+    if (sessionConfig.mode === 'standalone' || !(await hubAvailable())) {
+      return codedRefusal(PERSISTENT_STANDALONE_UNSUPPORTED, 'PERSISTENT_STANDALONE_UNSUPPORTED');
+    }
+    persistentMode = true;
+  }
 
   // CLI profile dispatch: worker= names a profile and bypasses the
   // hub/standalone tier logic entirely (no tier policy, no escalation — the
@@ -225,6 +284,80 @@ server.registerTool('dsh_run_worker', {
 
   const perm = resolveWorkerPermission({ permission, allowConcurrentCwd: !!allow_concurrent_cwd });
   const taskWithContract = appendSummaryContract(task, { permission: perm.permission });
+
+  // ---------- persistent dispatch (opt-in) ----------
+  // ONE reusable hub session spread over several blocking calls. The first turn
+  // CREATES it (`persistent: true` -> hub.spawn), every later turn appends to it
+  // (`session_id` -> hub.sessionTurn).
+  //
+  // Preset is the tolerant-inheritance rule and the subtle part: only a
+  // CALLER-SUPPLIED preset travels on a follow-up. Omitting it is exactly how a
+  // session keeps the preset it locked at creation (switching flash <-> pro on
+  // turn 2, or editing the panel's preset_flash, must not invalidate it), so
+  // resolving this tier's default here and sending THAT would turn a silent
+  // inheritance into a SESSION_PRESET_MISMATCH. An explicit preset still travels
+  // so the hub can compare it and refuse a real conflict.
+  const presetExplicit = typeof preset === 'string' && preset.trim() !== '' ? preset.trim() : null;
+
+  const runPersistent = async (t) => {
+    const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: 'hub', cwd: workDir, source: ORCHESTRATOR, depthLimit });
+    if (!origin.ok) return { refusal: originRefusal(origin) };
+    let lock;
+    try {
+      lock = await acquireDispatchLock({ cwd: workDir, backend: 'hub', mode: 'hub', allowConcurrent: !!allow_concurrent_cwd });
+    } catch (err) {
+      if (err instanceof CwdLockError) return { refusal: text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder }) };
+      throw err;
+    }
+    // The lock covers this turn only and is dropped in `finally`, never held
+    // across turns: a persistent session is idle between turns, and a lock kept
+    // alive would block the very next turn on the same workspace.
+    let spawned;
+    let turnSessionId = sessionId;
+    try {
+      const dispatch = {
+        task: taskWithContract,
+        tier: t,
+        effort: e,
+        cwd: workDir,
+        source: ORCHESTRATOR,
+        permission: perm.permission,
+        allow_concurrent_cwd: !!allow_concurrent_cwd,
+        maxPermission: perm.childMaxPermission,
+        ...bindingForTier(t),
+        ...(presetExplicit !== null ? { preset: presetExplicit } : {}),
+        origin_chain: origin.origin.chain,
+        origin_depth: origin.origin.depth,
+      };
+      spawned = sessionId !== null
+        ? await hub.sessionTurn(sessionId, dispatch)
+        // First turn: the resolved default preset is correct here, because this
+        // call is the one that LOCKS it for the session's whole life.
+        : await hub.spawn({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: presetForTier(t, preset), permission: perm.permission, allow_concurrent_cwd: !!allow_concurrent_cwd, maxPermission: perm.childMaxPermission, ...bindingForTier(t), persistent: true, origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
+      turnSessionId = spawned?.sessionId ?? spawned?.session_id ?? turnSessionId;
+      if (!spawned?.id) {
+        return { refusal: text({ error: 'the hub accepted the persistent dispatch but returned no job id', code: 'SESSION_RESUME_FAILED', session_id: turnSessionId }) };
+      }
+      updateCwdLockHolder({ cwd: workDir, jobId: spawned.id });
+      hubOrigins.set(spawned.id, origin.origin);
+      hubDispatchMeta.set(spawned.id, { permission: perm.permission, effective_sandbox_mode: perm.effective_sandbox_mode, preset: presetExplicit ?? undefined, ...(perm.permission_warning ? { permission_warning: perm.permission_warning } : {}) });
+      const got = await hub.get(spawned.id, timeout);
+      attachOrigin(got, spawned.id);
+      // The hub client slices this wait internally; a single request that waits
+      // minutes would be cut by undici's 300 s header timeout and reported as a
+      // bare "fetch failed" while the job kept running.
+      return { view: got, sessionId: turnSessionId };
+    } catch (err) {
+      // Session-level refusals are answers, not crashes: surface the hub's own
+      // stable code (SESSION_BUSY -> retry, SESSION_CLOSED -> start over) next to
+      // the prose so the MCP caller never has to match English.
+      const code = typeof err?.code === 'string' && /^(SESSION_|INVALID_PERSISTENT)/.test(err.code) ? err.code : null;
+      if (code !== null) return { refusal: text({ error: err.message, code, session_id: turnSessionId }) };
+      throw err;
+    } finally {
+      lock.release();
+    }
+  };
 
   const runOnce = async (t) => {
     const effectivePreset = presetForTier(t, preset);
@@ -270,6 +403,22 @@ server.registerTool('dsh_run_worker', {
   };
 
   const firstTier = applyTierPolicy(tier);
+
+  if (persistentMode) {
+    // A persistent turn is final: no flash -> pro retry. Escalating on failure
+    // would abandon the failed turn's context in place and continue the SAME
+    // session on pro, poisoning every later turn with a broken step. The caller
+    // decides — retry on the same session, or start a new one.
+    const res = await runPersistent(firstTier);
+    if (res.refusal) return res.refusal;
+    const { view, sessionId: turnSessionId } = res;
+    const withSession = { ...view, session_id: turnSessionId ?? null };
+    if (withSession.status === 'running') {
+      return text({ ...withSession, note: `still running after ${timeout}s; poll with dsh_worker_result, then continue this session with session_id` });
+    }
+    return text(finalizeWorkerResult(withSession, { inline_limit, full_reply }));
+  }
+
   let res = await runOnce(firstTier);
   if (res.refusal) return res.refusal;
   let job = res.view;
@@ -318,6 +467,7 @@ server.registerTool('dsh_worker_config', {
     pro_provider: z.string().optional().describe('LLM provider route the pro tier dispatches to. Same rules as flash_provider.'),
     pro_model: z.string().optional().describe('Model id for the pro tier. Empty string restores the default.'),
     origin_depth_limit: z.number().int().min(1).max(32).optional().describe('Max worker→worker origin-chain depth (default 3). Deeper dispatches are refused to stop recursive self-amplification; raise only for deliberate deep delegation.'),
+    persistent_sessions: z.boolean().optional().describe('Enable opt-in persistent DSH sessions (default false; global config value otherwise). While off, passing persistent/session_id to dsh_run_worker or calling dsh_session_close fails with PERSISTENT_SESSIONS_DISABLED. Turning it on does NOT change existing dispatches: only calls that pass persistent or session_id use a persistent session.'),
     reset: z.boolean().optional().describe('true = restore all defaults first'),
   },
 }, async ({ reset, ...patch }) => {
@@ -504,6 +654,28 @@ server.registerTool('dsh_worker_cancel', {
   }
   if (!getJob(job_id)) return text({ error: `no such job: ${job_id}` });
   return text(jobView(await cancelJob(job_id), { withResult: true }));
+});
+
+server.registerTool('dsh_session_close', {
+  title: 'Close DSH persistent session',
+  description: 'Destroy one opt-in persistent DSH session on the hub: its agent, its conversation context and any in-flight turn. Call it when a persistent worker is done for good (before the forwarded subagent ends its life). Only sessions created with persistent: true can be closed; a closed session_id is tombstoned, so a later turn with it fails with SESSION_CLOSED instead of silently starting fresh. Requires persistent_sessions enabled (else PERSISTENT_SESSIONS_DISABLED).',
+  inputSchema: {
+    session_id: z.string().describe('The session_id a persistent: true dispatch returned'),
+  },
+}, async ({ session_id }) => {
+  const sessionId = sessionIdArgOf(session_id);
+  if (sessionId === null) return codedRefusal('session_id is required', 'INVALID_PERSISTENT_ARGS');
+  if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');
+  if (!(await hubAvailable())) return codedRefusal(PERSISTENT_STANDALONE_UNSUPPORTED, 'PERSISTENT_STANDALONE_UNSUPPORTED');
+  try {
+    const result = await hub.closeSession(sessionId);
+    return text({ ...result, session_id: result?.session_id ?? sessionId });
+  } catch (err) {
+    // Closing is idempotent from the caller's point of view: an already-closed
+    // (or never-seen) session leaves nothing behind, and the hub kept the
+    // reason in its prose. Report it as an answer, not a crash.
+    return text({ error: err?.message ?? String(err), ...(err?.code ? { code: err.code } : {}), session_id: sessionId, closed: false });
+  }
 });
 
 await server.connect(new StdioServerTransport());
