@@ -24,6 +24,8 @@ import {
   resolveEffectivePreset,
   detectWindowsAclFailure,
   createTempWorktree,
+  detectPersistedWorktree,
+  writeWorktreeMarker,
 } from '../permission-policy.mjs';
 import {
   HubRequestError,
@@ -781,6 +783,21 @@ export class WorkerRegistry {
       rec.isolation = 'git-worktree';
       rec.degradedFrom = perm.effective_sandbox_mode;
       rec.dshSessionId = `${rec.sessionId}-wt`;
+      // Record the degradation BESIDE the worktree, so a hub restart can
+      // re-attach to it instead of silently resuming the original cwd and
+      // hiding every uncommitted file the worker produced here. Best effort:
+      // a marker that cannot be written must never fail a live turn.
+      writeWorktreeMarker({
+        worktreePath: rec.worktreePath,
+        facts: {
+          sessionId: rec.sessionId,
+          dshSessionId: rec.dshSessionId,
+          worktreePath: rec.worktreePath,
+          effectiveCwd: rec.effectiveCwd,
+          isolation: rec.isolation,
+          degradedFrom: rec.degradedFrom,
+        },
+      });
       if (rec.handle !== null) {
         try { await rec.handle.dispose(); } catch {}
         rec.handle = null;
@@ -1106,6 +1123,35 @@ export class WorkerRegistry {
       maxPermission: spec.maxPermission ?? spec.max_permission,
     }).permission;
 
+    // An `auto` degradation is DURABLE. The worktree path is deterministic
+    // (`%TEMP%\dsh-crew-worktrees\<session_id>`), so a worktree that still exists
+    // after the restart is proof that this session was degraded — and resuming
+    // the ORIGINAL id on the ORIGINAL cwd would silently hide every uncommitted
+    // file the worker produced in it. Re-attach to `<id>-wt` on the recorded
+    // worktree cwd instead. See permission-policy.mjs for the marker contract.
+    const persistedWorktree = detectPersistedWorktree({
+      sessionId,
+      baseDir: spec.worktreeBaseDir ?? this.worktreeBaseDir,
+    });
+    if (persistedWorktree !== null) {
+      rec.worktreePath = persistedWorktree.worktreePath;
+      rec.effectiveCwd = persistedWorktree.cwd;
+      rec.isolation = nonBlank(persistedWorktree.facts?.isolation) ?? 'git-worktree';
+      // `degradedFrom` is the sandbox mode the degradation moved AWAY from. The
+      // marker records it; a marker that predates the field cannot invent it, and
+      // `auto` always maps to `workspace-write`, so that is the honest fallback.
+      rec.degradedFrom = nonBlank(persistedWorktree.facts?.degradedFrom) ?? 'workspace-write';
+      // The degraded runtime has its OWN underlying session id, so the log that
+      // must be resumed is the worktree one, not the caller-facing id.
+      rec.dshSessionId = `${sessionId}-wt`;
+      this.ctx.logger?.info?.(
+        `dsh-crew: resuming degraded persistent session ${sessionId} on its worktree ${persistedWorktree.worktreePath}`,
+      );
+    }
+    // The cwd the persisted log must agree with: the worktree's when degraded,
+    // the caller's original baseline otherwise.
+    const resumeCwd = persistedWorktree === null ? cwdPath : canonicalCwd(persistedWorktree.cwd) ?? cwdPath;
+
     let handle;
     try {
       handle = await this.ctx.agents.resume({
@@ -1121,7 +1167,7 @@ export class WorkerRegistry {
             const session = agentCtx?.agent?.session;
             validateSessionTurnBinding({
               expectedCwd: session?.header?.cwd,
-              actualCwd: cwdPath,
+              actualCwd: resumeCwd,
               expectedPreset: resolvePersistedSessionPreset(session),
               explicitPreset: await this.canonicalPresetId(spec.preset),
             });
@@ -1159,6 +1205,10 @@ export class WorkerRegistry {
     rec.turns = countSettledTurns(handle?.agent?.session);
     rec.preset = resolvePersistedSessionPreset(handle?.agent?.session) ?? rec.preset ?? null;
     rec.lastActiveAt = Date.now();
+    // Report the recovered degradation instead of reverting silently: a caller
+    // that resumes a degraded session must be able to SEE that it is running on
+    // a worktree (the same facts the live degradation reports on the job view).
+    if (persistedWorktree !== null) rec.recoveredDegradation = true;
     this.persistentSessions.set(sessionId, rec);
     return rec;
   }

@@ -6,7 +6,7 @@
 // truth without duplicate module realms.
 
 import { execFile } from 'node:child_process';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -239,6 +239,92 @@ export function buildWorktreePath(jobId, baseDir = join(tmpdir(), 'dsh-crew-work
 async function defaultRunGit(args) {
   const { stdout } = await execFileAsync('git', args, { windowsHide: true });
   return stdout;
+}
+
+// ---------- persisting an `auto` degradation across a hub restart ----------
+//
+// DEFECT this exists for: after an `auto` ACL degradation the record held
+// `worktreePath`, `dshSessionId = "<id>-wt"`, `isolation` and `degradedFrom` in
+// MEMORY only. On a hub restart, recovery resumed the ORIGINAL sessionId on the
+// ORIGINAL cwd, so every uncommitted file the worker had produced in the
+// worktree silently vanished from the session's view — the caller kept talking to
+// a session that looked fine and had lost its work.
+//
+// The worktree path is deterministic (`%TEMP%\dsh-crew-worktrees\<sessionId>`,
+// see buildWorktreePath), so the FACT that a session was degraded is re-derivable
+// from the filesystem after the restart. What is NOT re-derivable is the worker's
+// cwd inside that worktree (createTempWorktree maps the original cwd's
+// repo-relative subdirectory into it) and the sandbox mode it degraded FROM. So a
+// small marker file is written NEXT TO the worktree (its own temp base
+// directory — never the user's repo and never ~/.config) carrying exactly those
+// facts. Recovery: if a worktree for this session id exists, re-attach to
+// `<id>-wt` on the cwd recorded there instead of silently reverting.
+//
+// This adds no new durable store: the worktree itself is the durable artifact,
+// and the marker lives beside it, so cleaning up a worktree cleans up its
+// marker too.
+export const WORKTREE_MARKER_SUFFIX = '.degradation.json';
+
+/** The marker path for one worktree (a sibling, never inside the git worktree). */
+export function worktreeMarkerPath(worktreePath) {
+  return `${worktreePath}${WORKTREE_MARKER_SUFFIX}`;
+}
+
+/**
+ * Record the degradation facts beside a worktree. Best effort: a failure to
+ * write the marker must never fail the turn that is already running.
+ */
+export function writeWorktreeMarker({ worktreePath, facts } = {}) {
+  if (typeof worktreePath !== 'string' || worktreePath === '') return null;
+  const markerPath = worktreeMarkerPath(worktreePath);
+  try {
+    writeFileSync(markerPath, JSON.stringify({ ...facts, recordedAt: new Date().toISOString() }, null, 2) + '\n');
+    return markerPath;
+  } catch {
+    return null;
+  }
+}
+
+/** Read a worktree's degradation marker, or null when it is absent/unreadable. */
+export function readWorktreeMarker({ worktreePath } = {}) {
+  if (typeof worktreePath !== 'string' || worktreePath === '') return null;
+  try {
+    const parsed = JSON.parse(readFileSync(worktreeMarkerPath(worktreePath), 'utf8'));
+    return parsed !== null && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Did this session degrade onto a worktree, and where should it resume?
+ *
+ * Returns `null` when no worktree exists for the session (the ordinary case), or
+ * `{ worktreePath, cwd, facts }` when one does. `cwd` prefers the worker cwd the
+ * marker recorded (the worktree path plus the original cwd's repo-relative
+ * subdirectory) and falls back to the worktree root for a worktree whose marker
+ * predates this file — a worktree with uncommitted work is still strictly better
+ * than silently resuming on the original cwd.
+ */
+export function detectPersistedWorktree({ sessionId, baseDir } = {}) {
+  const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (id === '') return null;
+  let worktreePath;
+  try {
+    worktreePath = buildWorktreePath(id, baseDir);
+  } catch {
+    return null;
+  }
+  let stat;
+  try {
+    stat = statSync(worktreePath);
+  } catch {
+    return null;
+  }
+  if (!stat.isDirectory()) return null;
+  const facts = readWorktreeMarker({ worktreePath });
+  const recordedCwd = typeof facts?.effectiveCwd === 'string' && facts.effectiveCwd !== '' ? facts.effectiveCwd : null;
+  return { worktreePath, cwd: recordedCwd ?? worktreePath, facts };
 }
 
 /**
