@@ -147,6 +147,40 @@ function originRefusal(res) {
   return text({ error: `dispatch refused by origin guard: ${res.error.reason}`, ...res.error });
 }
 
+// ---------- persistent turn watchdog budget ----------
+
+/**
+ * The hub-side watchdog budget for ONE persistent turn, derived from the
+ * caller's own `timeout_seconds`.
+ *
+ * The defect this exists for: the hub had a hard 30-minute default and the MCP
+ * layer never sent a budget, so `timeout_seconds: 2700` (a legitimate 45-minute
+ * turn the tool schema explicitly allows up to 7200) was killed at 30 minutes.
+ *
+ * The rule: the watchdog must fire AFTER the caller's own deadline, never
+ * before. The caller's deadline bounds how long THIS call blocks; the watchdog
+ * bounds how long the hub keeps the session claimed before reclaiming it from a
+ * hung turn. Those are different questions, so the hub gets a margin:
+ *
+ *   margin = max(120 s, 10 % of the deadline)
+ *
+ * - the floor (2 min) covers the last hub poll slice (MAX_POLL_SLICE_SECONDS =
+ *   60 s) plus flush/teardown, so a turn that settles at the caller's deadline
+ *   is never reported as failed by the watchdog;
+ * - the proportional part keeps the margin from swallowing the watchdog on a
+ *   long turn (a 2 h turn gets a 12 min margin, not 2 min).
+ *
+ * Returns `undefined` when no budget can be derived (`timeout_seconds` <= 0, or
+ * not a finite number): then the hub's own default applies, which is the
+ * documented fallback — this never disables the watchdog by accident.
+ */
+function persistentTurnWatchdogMs(timeoutSeconds) {
+  const seconds = Number(timeoutSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  const marginMs = Math.max(120_000, Math.round(seconds * 0.1) * 1000);
+  return Math.round(seconds * 1000) + marginMs;
+}
+
 /**
  * Acquire the cwd advisory lock for a hub dispatch (job id is unknown until
  * the hub answers, so it is backfilled by updateCwdLockHolder). A conflict
@@ -342,6 +376,9 @@ server.registerTool('dsh_run_worker', {
     let spawned;
     let turnSessionId = sessionId;
     let keepLockUntilSettled = false;
+    // The hub reclaims a wedged turn on this budget; it must be LARGER than this
+    // call's own deadline so a slow-but-healthy turn is never killed first.
+    const turnTimeoutMs = persistentTurnWatchdogMs(timeout);
     try {
       const dispatch = {
         task: taskWithContract,
@@ -354,6 +391,7 @@ server.registerTool('dsh_run_worker', {
         maxPermission: perm.childMaxPermission,
         ...bindingForTier(t),
         ...(presetExplicit !== null ? { preset: presetExplicit } : {}),
+        ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }),
         origin_chain: origin.origin.chain,
         origin_depth: origin.origin.depth,
       };
@@ -361,7 +399,7 @@ server.registerTool('dsh_run_worker', {
         ? await hub.sessionTurn(sessionId, dispatch)
         // First turn: the resolved default preset is correct here, because this
         // call is the one that LOCKS it for the session's whole life.
-        : await hub.spawn({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: presetForTier(t, preset), permission: perm.permission, allow_concurrent_cwd: !!allow_concurrent_cwd, maxPermission: perm.childMaxPermission, ...bindingForTier(t), persistent: true, origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
+        : await hub.spawn({ task: taskWithContract, tier: t, effort: e, cwd: workDir, source: ORCHESTRATOR, preset: presetForTier(t, preset), permission: perm.permission, allow_concurrent_cwd: !!allow_concurrent_cwd, maxPermission: perm.childMaxPermission, ...bindingForTier(t), persistent: true, ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }), origin_chain: origin.origin.chain, origin_depth: origin.origin.depth });
       turnSessionId = spawned?.sessionId ?? spawned?.session_id ?? turnSessionId;
       if (!spawned?.id) {
         return { refusal: text({ error: 'the hub accepted the persistent dispatch but returned no job id', code: 'SESSION_RESUME_FAILED', session_id: turnSessionId }) };

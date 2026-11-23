@@ -215,6 +215,66 @@ test('the watchdog is disabled by a zero/negative timeout and by default resolut
   assert.equal(withDefault.persistentSessions.get(viaDefault.sessionId).status, 'idle');
 });
 
+test('the watchdog budget follows the caller, not a hard 30-minute cap', async () => {
+  // DEFECT: the hub armed every turn with a fixed 30-minute default and nothing
+  // passed a per-turn budget, so the MCP layer's documented `timeout_seconds`
+  // (up to 7200 s) could not be honoured: a legitimate 45-minute turn was killed
+  // at 30 minutes. The turn job now records the budget it actually armed, so the
+  // value is assertable without waiting on a wall clock.
+  const fake = makeCtx({ settle: false });
+  const registry = makeRegistry(fake);
+
+  // A caller budget above the old 30-minute cap is taken verbatim.
+  const long = await registry.spawnPersistentSession({
+    task: '45 minute turn', cwd: ISOLATED_HOME, turnTimeoutMs: 2_700_000 + 270_000,
+  });
+  assert.equal(long.watchdogMs, 2_970_000, 'the caller budget reaches the watchdog unchanged');
+  assert.equal(long.watchdogSource, 'turn');
+  assert.notEqual(long.watchdogTimer, null);
+  registry.clearTurnWatchdog(long);
+
+  // The hub-level default wins over the module fallback...
+  registry.persistentTurnTimeoutMs = 5_000;
+  const viaConfig = await registry.spawnPersistentSession({ task: 'config budget', cwd: ISOLATED_HOME });
+  assert.equal(viaConfig.watchdogMs, 5_000);
+  assert.equal(viaConfig.watchdogSource, 'config');
+  registry.clearTurnWatchdog(viaConfig);
+
+  // ...and with neither, the fallback covers the largest documented caller
+  // budget (7200 s) plus its margin, so a silent caller is never killed EARLIER
+  // than an explicit two-hour caller would be.
+  delete registry.persistentTurnTimeoutMs;
+  const viaFallback = await registry.spawnPersistentSession({ task: 'fallback budget', cwd: ISOLATED_HOME });
+  assert.equal(viaFallback.watchdogSource, 'default');
+  assert.ok(viaFallback.watchdogMs > 7_200_000, `the fallback exceeds the largest caller budget, got ${viaFallback.watchdogMs}`);
+  registry.clearTurnWatchdog(viaFallback);
+});
+
+test('an unusable watchdog budget falls through instead of silently disabling', async () => {
+  // A broken setting must not switch the safety net off: only an explicit numeric
+  // 0/negative disables the watchdog. NaN / junk / blank strings fall through to
+  // the next candidate.
+  const fake = makeCtx({ settle: false });
+  const registry = makeRegistry(fake);
+  registry.persistentTurnTimeoutMs = 30_000;
+
+  for (const junk of ['not-a-number', '', Number.NaN]) {
+    const job = await registry.spawnPersistentSession({
+      task: `junk budget ${String(junk)}`, cwd: ISOLATED_HOME, turnTimeoutMs: junk,
+    });
+    assert.equal(job.watchdogSource, 'config', `${JSON.stringify(junk)} must fall through, not disable`);
+    assert.equal(job.watchdogMs, 30_000);
+    assert.notEqual(job.watchdogTimer, null);
+    registry.clearTurnWatchdog(job);
+  }
+
+  // An explicit 0 still disables, all the way down.
+  const off = await registry.spawnPersistentSession({ task: 'off', cwd: ISOLATED_HOME, turnTimeoutMs: 0 });
+  assert.equal(off.watchdogSource, 'turn');
+  assert.equal(off.watchdogTimer, null);
+  registry.clearTurnWatchdog(off);
+});
+
 test('A2: a normal turn clears its watchdog timer (no leaked timer keeps the process alive)', async () => {
   const fake = makeCtx();
   const registry = makeRegistry(fake);

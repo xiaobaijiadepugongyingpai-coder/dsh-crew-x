@@ -570,6 +570,54 @@ test('a hub refusal on close comes back as { closed: false, code, session_id }',
   }
 });
 
+// ---------- 6. the caller's timeout reaches the hub watchdog ----------
+
+test('timeout_seconds travels to the hub as the persistent turn watchdog budget', async () => {
+  // DEFECT: the hub watchdog hard-capped a turn at 30 minutes because nothing
+  // ever passed a budget, while the tool schema documents timeout_seconds up to
+  // 7200 s. A 45-minute turn was therefore killed at 30 minutes. The MCP layer
+  // now derives `turnTimeoutMs` from timeout_seconds — always LARGER than the
+  // caller's own deadline, so the watchdog reclaims a hung turn instead of
+  // enforcing the caller's deadline — and sends it on both persistent paths.
+  await withStack(async ({ hub, mcp }) => {
+    await mcp.callTool('dsh_worker_config', { persistent_sessions: true, mode: 'hub' });
+
+    // 1. First turn (POST /jobs): a budget well above the old 30-minute cap.
+    const first = await mcp.callTool('dsh_run_worker', {
+      task: 'long turn', cwd: ISOLATED_HOME, persistent: true, timeout_seconds: 3600,
+    });
+    assert.equal(first.isError, false, first.text);
+    const spawnBody = hub.received.find((r) => r.path === '/_dsh/dsh-crew/jobs').body;
+    // 3600 s deadline + max(120 s, 10 %) = 3960 s.
+    assert.equal(spawnBody.turnTimeoutMs, 3_960_000, 'the caller budget reaches the hub, not a 30-minute cap');
+    assert.ok(spawnBody.turnTimeoutMs > 1_800_000, 'the old hard cap is gone');
+
+    // 2. Follow-up turn (POST /sessions/:id/turns): the budget follows the caller.
+    const sessionId = first.payload.session_id;
+    const second = await mcp.callTool('dsh_run_worker', {
+      task: 'short turn', cwd: ISOLATED_HOME, session_id: sessionId, timeout_seconds: 60,
+    });
+    assert.equal(second.isError, false, second.text);
+    const turnRequest = hub.received.find((r) => /\/sessions\/[^/]+\/turns$/.test(r.path));
+    assert.ok(turnRequest !== undefined, 'turn 2 went through the sessions route');
+    // 60 s deadline is under the 2-minute margin floor: 60 s + 120 s.
+    assert.equal(turnRequest.body.turnTimeoutMs, 180_000, 'the follow-up carries its own budget');
+
+    // 3. An omitted timeout_seconds uses this session's default deadline, and the
+    //    watchdog still gets a larger budget derived from it.
+    const third = await mcp.callTool('dsh_run_worker', { task: 'default budget', cwd: ISOLATED_HOME, session_id: sessionId });
+    assert.equal(third.isError, false, third.text);
+    const thirdTurn = hub.received.filter((r) => /\/sessions\/[^/]+\/turns$/.test(r.path)).at(-1);
+    const defaultTimeoutMs = 1800 * 1000; // GLOBAL_CONFIG_DEFAULTS.default_timeout_seconds
+    assert.equal(
+      thirdTurn.body.turnTimeoutMs,
+      defaultTimeoutMs + Math.max(120_000, defaultTimeoutMs / 10),
+      'the session default deadline also yields a watchdog budget past that deadline',
+    );
+    assert.ok(thirdTurn.body.turnTimeoutMs > defaultTimeoutMs, 'the watchdog must never fire before the caller deadline');
+  });
+});
+
 // ---------- 5. timed-out persistent turn keeps cwd lock until settled ----------
 
 test('a timed-out persistent turn holds the cwd lock until dsh_worker_result observes it settled', async () => {

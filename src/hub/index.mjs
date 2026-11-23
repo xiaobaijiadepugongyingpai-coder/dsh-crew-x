@@ -46,11 +46,55 @@ const MAX_IDLE_TIMEOUT_MINUTES = 1440;
 // session back. Without this, an agent/tool/worktree that never settles leaves
 // `rec.status === 'running'` forever: the idle reaper skips running sessions by
 // design, so every later turn on that session would be 409 SESSION_BUSY until
-// someone cancelled the job, closed the session, or restarted the hub. The
-// client-side `timeout_seconds` only bounds the MCP poll, not the hub's turn.
-// 30 minutes is generous for a real worker turn and short enough that a wedged
-// session recovers on its own. `0` or negative disables the watchdog entirely.
-const DEFAULT_PERSISTENT_TURN_TIMEOUT_MS = 1_800_000;
+// someone cancelled the job, closed the session, or restarted the hub.
+//
+// This value is the FALLBACK for a caller that names no budget at all (a direct
+// API caller, or an MCP layer too old to send one). The watchdog must never cut
+// a legitimate long turn short: the MCP layer's `timeout_seconds` accepts up to
+// 7200 s, so `src/server.mjs` derives a `turnTimeoutMs` from it (its own deadline
+// plus a margin, i.e. the watchdog always fires AFTER the caller would have given
+// up) and sends it on every persistent dispatch. The watchdog exists to reclaim
+// a hung turn, not to enforce the caller's deadline.
+//
+// The fallback therefore covers the LARGEST caller budget the documented API
+// allows, plus the same margin rule src/server.mjs uses (max(120 s, 10 %)), so a
+// silent caller can never be killed earlier than an explicit 2 h one would be.
+// A wedged session still recovers on its own — just not at the cost of a healthy
+// long turn. `0` or negative disables the watchdog entirely.
+const MAX_CALLER_TURN_BUDGET_MS = 7_200_000;
+const DEFAULT_PERSISTENT_TURN_TIMEOUT_MS = MAX_CALLER_TURN_BUDGET_MS + Math.max(120_000, MAX_CALLER_TURN_BUDGET_MS / 10);
+
+// Ceiling for a caller-supplied watchdog budget. `setTimeout` stores its delay
+// in a 32-bit signed int: anything above 2^31-1 ms OVERFLOWS and fires
+// IMMEDIATELY, which would fail a healthy turn instead of waiting for it. 24 h
+// is far beyond any real turn and safely inside that range, so a garbage value
+// is clamped here rather than detonating the watchdog.
+const MAX_PERSISTENT_TURN_TIMEOUT_MS = 86_400_000;
+
+/**
+ * Resolve the watchdog budget from named candidates, in priority order.
+ *
+ * Only an explicit, numeric 0/negative value DISABLES the watchdog. A value that
+ * is present but unusable (a typo in config, a blank string, a NaN from a bad
+ * conversion) falls THROUGH to the next candidate instead of silently switching
+ * the watchdog off: a hub with a broken setting must still be able to reclaim a
+ * wedged session. A finite positive value is clamped to
+ * MAX_PERSISTENT_TURN_TIMEOUT_MS.
+ *
+ * Returns `{ ms, source }`; `ms <= 0` means "disabled".
+ */
+function resolveTurnTimeoutMs(candidates) {
+  for (const { value, source } of candidates) {
+    if (value === undefined || value === null) continue;
+    // A blank string means "not configured", not "0 ms".
+    if (typeof value === 'string' && value.trim() === '') continue;
+    const ms = Number(value);
+    if (!Number.isFinite(ms)) continue;
+    if (ms <= 0) return { ms, source };
+    return { ms: Math.min(ms, MAX_PERSISTENT_TURN_TIMEOUT_MS), source };
+  }
+  return { ms: DEFAULT_PERSISTENT_TURN_TIMEOUT_MS, source: 'default' };
+}
 
 /** True when `value` is a non-blank string. */
 function nonBlank(value) {
@@ -820,11 +864,32 @@ export class WorkerRegistry {
    * Without it a turn whose agent never settles leaves the record `running`
    * forever, and the idle reaper deliberately skips running sessions — so every
    * later turn would be SESSION_BUSY with no way back short of a cancel, a close
-   * or a hub restart. `0`/negative (or a non-finite value) disables it.
+   * or a hub restart.
+   *
+   * WAIT IS RESOLVED IN THIS ORDER and recorded on the job as `watchdogMs`/
+   * `watchdogSource`, so an operator (and a test) can see WHICH budget actually
+   * armed it instead of inferring it from a wall clock:
+   *
+   *   1. `spec.turnTimeoutMs` — the per-turn budget the caller computed from its
+   *      own `timeout_seconds` (see src/server.mjs). This is the fix for the
+   *      hard 30-minute cap: a caller allowed 2 h must not be killed at 30 min.
+   *   2. `this.persistentTurnTimeoutMs` — the hub's own configured default.
+   *   3. `DEFAULT_PERSISTENT_TURN_TIMEOUT_MS` — the fallback for a caller that
+   *      names no budget at all.
+   *
+   * `0`/negative disables it; an unusable value at one level falls through to
+   * the next (see resolveTurnTimeoutMs) rather than disabling the watchdog by
+   * accident.
    */
   armTurnWatchdog(rec, job, spec = {}) {
-    const configured = spec.turnTimeoutMs ?? this.persistentTurnTimeoutMs ?? DEFAULT_PERSISTENT_TURN_TIMEOUT_MS;
-    const ms = Number(configured);
+    const { ms, source } = resolveTurnTimeoutMs([
+      { value: spec.turnTimeoutMs, source: 'turn' },
+      { value: this.persistentTurnTimeoutMs, source: 'config' },
+    ]);
+    // Always record the resolved budget, including a disabled one, so the value
+    // a caller asked for is observable without waiting for the timer.
+    job.watchdogMs = ms;
+    job.watchdogSource = source;
     if (!Number.isFinite(ms) || ms <= 0) return;
     job.watchdogTimer = setTimeout(() => this.fireTurnWatchdog(rec, job, ms), ms);
     // Never hold the process (or `node --test`) open for a watchdog.
