@@ -209,9 +209,17 @@ async function startRealHub({ config = {}, fake = makeCtx() } = {}) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const raw = Buffer.concat(chunks).toString();
+    // `method` + `contentType` are recorded for EVERY request (body or not) so a
+    // test can assert on the wire headers the real hub guard judges. The
+    // state-mutating POST guard refuses a request without
+    // `content-type: application/json`, and that refusal is invisible in a
+    // JSON-only recording of a bodiless POST.
+    const record = { path: url.pathname, method: req.method, contentType: req.headers['content-type'] ?? null };
     if (raw !== '') {
-      try { received.push({ path: url.pathname, body: JSON.parse(raw) }); }
-      catch { received.push({ path: url.pathname, body: raw }); }
+      try { received.push({ ...record, body: JSON.parse(raw) }); }
+      catch { received.push({ ...record, body: raw }); }
+    } else {
+      received.push({ ...record, body: undefined });
     }
     // Re-model the stream for the handler, which reads it itself.
     req[Symbol.asyncIterator] = async function* iterator() {
@@ -620,6 +628,8 @@ test('timeout_seconds travels to the hub as the persistent turn watchdog budget'
 
 // ---------- 5. timed-out persistent turn keeps cwd lock until settled ----------
 
+// ---------- 5. timed-out persistent turn keeps cwd lock until settled ----------
+
 test('a timed-out persistent turn holds the cwd lock until dsh_worker_result observes it settled', async () => {
   await withStack(async ({ hub, mcp }) => {
     await mcp.callTool('dsh_worker_config', { persistent_sessions: true, mode: 'hub' });
@@ -654,5 +664,131 @@ test('a timed-out persistent turn holds the cwd lock until dsh_worker_result obs
       cwd: ISOLATED_HOME,
     });
     assert.equal(next.payload.status, 'done', next.text);
+  });
+});
+
+// ---------- 7. dsh_worker_cancel over real HTTP (P0 JSON guard) ----------
+
+test('dsh_worker_cancel sends a JSON content-type and really cancels a running job', async () => {
+  // DEFECT (live Antigravity + DSH hub test, not unit tests): the P0
+  // content-type guard was added to POST /jobs/:id/cancel, but hub-client's
+  // `cancel()` sent NEITHER a content-type header NOR a body, so every MCP
+  // `dsh_worker_cancel` call died with HTTP 415 UNSUPPORTED_MEDIA_TYPE before
+  // reaching the registry. Every existing suite passed because none of them
+  // drove the tool through real HTTP into the real `apply()` hub — the two
+  // halves were each tested, and the wire between them was not.
+  //
+  // This test closes that gap for real: a hanging job is spawned through
+  // `dsh_spawn_worker`, then `dsh_worker_cancel` is called over stdio, and the
+  // assertions read the HTTP request the real hub actually received plus the
+  // registry state it produced.
+  await withStack(async ({ hub, mcp }) => {
+    await mcp.callTool('dsh_worker_config', { mode: 'hub' });
+
+    // Hold the turn open so the job is genuinely `running` when cancelled.
+    const release = hub.fake.holdTurns();
+    const spawned = await mcp.callTool('dsh_spawn_worker', {
+      task: 'hang until cancelled',
+      cwd: ISOLATED_HOME,
+      permission: 'read-only',
+    });
+    assert.equal(spawned.isError, false, spawned.text);
+    const jobId = spawned.payload.id;
+    assert.match(jobId, /^hub-/, `expected a hub job id, got ${spawned.text}`);
+    assert.equal(spawned.payload.status, 'running', 'the spawn worker returns a claim, not a result');
+
+    try {
+      const cancelled = await mcp.callTool('dsh_worker_cancel', { job_id: jobId });
+
+      // 1. The refusal must be gone. A 415 from the guard never becomes a job
+      //    view: hub-client turns a non-2xx into a thrown error carrying the
+      //    hub's prose, and the tool surfaces it as `{ error }` with NO job id
+      //    and NO status. So the decisive check is that a real job view came
+      //    back at all, and that its prose is not the guard's.
+      assert.equal(
+        /application\/json required/.test(String(cancelled.payload.error ?? '')),
+        false,
+        `dsh_worker_cancel was refused by the content-type guard: ${cancelled.text}`,
+      );
+      assert.equal(cancelled.payload.code, undefined, `a 415 refusal leaked a code: ${cancelled.text}`);
+
+      // 2. The real hub actually cancelled the job. (A cancelled job legitimately
+      //    records `error: 'cancelled by request'` next to its status — that is
+      //    the registry's own bookkeeping, not a refusal.)
+      assert.equal(cancelled.payload.id, jobId);
+      assert.equal(cancelled.payload.status, 'cancelled', `expected cancelled, got ${cancelled.text}`);
+      assert.equal(cancelled.payload.error, 'cancelled by request');
+
+      // 3. THE assertion the defect is about: the request that crossed the wire
+      //    declared application/json, so the guard let it through on its merits
+      //    rather than because the route was exempted.
+      const cancelRequest = hub.received.find((r) => r.path === `/_dsh/dsh-crew/jobs/${jobId}/cancel`);
+      assert.ok(cancelRequest !== undefined, 'the cancel request reached the real hub route');
+      assert.equal(cancelRequest.method, 'POST');
+      assert.equal(
+        cancelRequest.contentType,
+        'application/json',
+        'cancel must declare content-type: application/json (the guard requires it)',
+      );
+      assert.deepEqual(cancelRequest.body, {}, 'cancel sends a JSON body, like every sibling call');
+
+      // 4. The registry disposed the runtime and published the settled state.
+      assert.ok(hub.fake.log.disposes >= 1, 'a cancelled one-shot job releases its runtime');
+    } finally {
+      // Let the gated turn unwind so nothing is left pending behind the test.
+      release();
+    }
+
+    // The cancellation is durable: a second cancel is a no-op that still
+    // reports the settled job instead of re-running anything.
+    const again = await mcp.callTool('dsh_worker_cancel', { job_id: jobId });
+    assert.equal(again.payload.status, 'cancelled', again.text);
+  });
+});
+
+// Every mutating route this client drives must carry the JSON content-type, or
+// the P0 guard 415s it. This is the systematic version of the cancel check:
+// it derives the pairs from the traffic of a normal session, so a future route
+// that forgets the header fails here instead of in a live run.
+test('every state-mutating POST the MCP layer sends declares a JSON content-type', async () => {
+  await withStack(async ({ hub, mcp }) => {
+    await mcp.callTool('dsh_worker_config', { persistent_sessions: true, mode: 'hub' });
+
+    // Drive each mutating client call that this harness can reach: spawn (POST
+    // /jobs), a persistent session turn (POST /sessions/:id/turns), close
+    // (POST /sessions/:id/close), a one-shot spawn + cancel. `/worker-probe`
+    // and `/proc-kill` need a live provider/process and are covered by their
+    // own route tests; their client calls are asserted structurally below.
+    const first = await mcp.callTool('dsh_run_worker', { task: 'turn one', cwd: ISOLATED_HOME, persistent: true });
+    assert.equal(first.isError, false, first.text);
+    const sessionId = first.payload.session_id;
+    const second = await mcp.callTool('dsh_run_worker', { task: 'turn two', cwd: ISOLATED_HOME, session_id: sessionId });
+    assert.equal(second.isError, false, second.text);
+    const closed = await mcp.callTool('dsh_session_close', { session_id: sessionId });
+    assert.equal(closed.payload.closed, true, closed.text);
+
+    const release = hub.fake.holdTurns();
+    const spawned = await mcp.callTool('dsh_spawn_worker', { task: 'cancel me', cwd: ISOLATED_HOME, permission: 'read-only' });
+    const cancelTarget = spawned.payload.id;
+    try {
+      await mcp.callTool('dsh_worker_cancel', { job_id: cancelTarget });
+    } finally {
+      release();
+    }
+
+    const mutating = hub.received.filter((r) => (
+      r.method === 'POST'
+      && ['/_dsh/dsh-crew/jobs', `/_dsh/dsh-crew/jobs/${cancelTarget}/cancel`].concat(
+        hub.received.filter((x) => /\/sessions\/[^/]+\/(turns|close)$/.test(x.path)).map((x) => x.path),
+      ).includes(r.path)
+    ));
+    assert.ok(mutating.length >= 4, `expected spawn/turn/close/cancel traffic, got ${JSON.stringify(hub.received.map((r) => [r.method, r.path]))}`);
+    for (const req of mutating) {
+      assert.equal(
+        req.contentType,
+        'application/json',
+        `${req.method} ${req.path} reached the hub without a JSON content-type -> the P0 guard would 415 it`,
+      );
+    }
   });
 });
