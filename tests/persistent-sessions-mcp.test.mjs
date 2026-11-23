@@ -596,3 +596,80 @@ test('src stays free of @deepseek-ai imports for the persistent-session modules'
   const client = readFileSync(join(ROOT, 'src/hub-client.mjs'), 'utf8');
   assert.ok(client.includes('MAX_POLL_SLICE_SECONDS = 60'));
 });
+
+// ---------- 4. dsh_spawn_worker REFUSES persistent arguments ----------
+
+// DEFECT (live Antigravity + DSH hub run, all suites green): the design assumed
+// zod would reject an undeclared `persistent`, but zod's default object
+// behaviour STRIPS unknown keys. `dsh_spawn_worker({ task, persistent: true })`
+// therefore ran a one-shot task with persistent: false and returned no error, so
+// a caller that believed it had opened a reusable session only found out turns
+// later. Async fan-out can never host a reusable session, so the honest answer
+// is a refusal with a stable code — never a silent downgrade.
+//
+// These tests drive the real src/server.mjs over stdio, so they observe exactly
+// what an MCP caller observes.
+test('dsh_spawn_worker refuses persistent/session_id with PERSISTENT_ASYNC_UNSUPPORTED', async () => {
+  const { callTool, stop } = await startServer();
+  try {
+    // Presence is the signal, matching how dsh_run_worker treats a supplied
+    // session_id: `persistent: false` and `session_id: ""` are still a caller
+    // asking for something this tool cannot provide, and answering "fine, I
+    // dropped it" is precisely the defect.
+    const cases = [
+      [{ persistent: true }, 'persistent: true'],
+      [{ persistent: false }, 'persistent: false'],
+      [{ session_id: 'x' }, 'session_id: "x"'],
+      [{ session_id: '' }, 'session_id: ""'],
+      [{ persistent: true, session_id: 'x' }, 'both together'],
+      [{ persistent: false, session_id: '' }, 'both together, falsy'],
+    ];
+    for (const [extra, label] of cases) {
+      const r = await callTool('dsh_spawn_worker', { task: 'ok', ...extra });
+      const code = r.payload.code ?? r.payload.error_code ?? null;
+      assert.equal(code, 'PERSISTENT_ASYNC_UNSUPPORTED', `${label} must be refused with the stable code, got ${r.text}`);
+      // An explicit refusal, not a generic MCP validation error, and never a
+      // job view: a caller must not be able to mistake this for a dispatch.
+      assert.equal(r.payload.id, undefined, `${label}: a refusal must not return a job id (${r.text})`);
+      assert.equal(r.payload.status, undefined, `${label}: a refusal must not return a job status`);
+      assert.match(String(r.payload.error), /dsh_run_worker/, `${label}: the refusal names the tool that CAN do it`);
+    }
+  } finally {
+    await stop();
+  }
+});
+
+test('tools/list still hides persistent/session_id on dsh_spawn_worker after the refusal change', async () => {
+  const { request, stop } = await startServer();
+  try {
+    const listed = await request('tools/list', {});
+    const spawnProps = new Map((listed.result?.tools ?? []).map((t) => [t.name, t])).get('dsh_spawn_worker').inputSchema.properties ?? {};
+    assert.equal(spawnProps.persistent, undefined, 'dsh_spawn_worker must NOT advertise persistent');
+    assert.equal(spawnProps.session_id, undefined, 'dsh_spawn_worker must NOT advertise session_id');
+    // The declared one-shot arguments are untouched by the parse-behaviour swap.
+    for (const key of ['task', 'tier', 'effort', 'worker', 'cwd', 'allow_concurrent_cwd', 'permission', 'preset']) {
+      assert.ok(spawnProps[key] !== undefined, `dsh_spawn_worker must still advertise ${key}`);
+    }
+  } finally {
+    await stop();
+  }
+});
+
+test('a dsh_spawn_worker call with NEITHER persistent param still dispatches one-shot', async () => {
+  const { server } = makeStubHub();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const { callTool, stop } = await startServer({ stubPort: port });
+  try {
+    await callTool('dsh_worker_config', { mode: 'hub' });
+    const spawned = await callTool('dsh_spawn_worker', { task: 'ordinary fan-out', cwd: ISOLATED_HOME });
+    // The refusal must not have cost the ordinary path: no code, and a real job.
+    assert.equal(spawned.payload.code, undefined, spawned.text);
+    assert.equal(spawned.payload.id, 'hub-p1', spawned.text);
+    assert.equal(spawned.payload.error, undefined, `an ordinary spawn must not be refused: ${spawned.text}`);
+  } finally {
+    await stop();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+

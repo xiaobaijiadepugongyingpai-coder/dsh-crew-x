@@ -217,6 +217,12 @@ const PERSISTENT_SESSIONS_DISABLED = 'persistent sessions are disabled: turn the
 const INVALID_PERSISTENT_ARGS = 'invalid persistent arguments: pass EITHER persistent: true for the first turn (which creates the session) OR a non-empty session_id for later turns, never both, and never an empty session_id — an empty id is a resumption request with nothing to resume, so it is refused instead of quietly running a cold one-shot task.';
 const PERSISTENT_CLI_UNSUPPORTED = 'persistent sessions are not supported for external CLI workers (worker=...): those run a one-shot CLI process with no DSH session to reuse. Omit worker= or leave persistent/session_id unset.';
 const PERSISTENT_STANDALONE_UNSUPPORTED = 'persistent sessions need the DSH hub, which is not reachable (this dispatch would fall back to standalone). Start DSH, set mode: "hub" via dsh_worker_config, or use a one-shot dispatch.';
+// dsh_spawn_worker is async fan-out and can never host a reusable session, so
+// these two arguments are REFUSED rather than stripped. Silently dropping them
+// (zod's default for undeclared keys) ran a one-shot job while the caller
+// believed it had opened a reusable session — a live Antigravity + DSH hub run
+// found exactly that. Use dsh_run_worker (blocking) when you need persistence.
+const PERSISTENT_ASYNC_UNSUPPORTED = 'persistent sessions are not supported on dsh_spawn_worker: that tool is async fan-out and always runs a one-shot task, so a requested session would be unusable. Pass neither persistent nor session_id here, or use dsh_run_worker (blocking) with persistent: true for a reusable session.';
 
 /** A refusal that carries its machine-readable code next to the prose. */
 function codedRefusal(message, code) {
@@ -577,20 +583,56 @@ server.registerTool('dsh_worker_config', {
   });
 });
 
-server.registerTool('dsh_spawn_worker', {
+// `dsh_spawn_worker` is the ASYNC fan-out tool and is deliberately a pure
+// one-shot surface: persistent sessions need one long-lived hub agent that
+// several BLOCKING turns append to, which is exactly what an async spawn does
+// not provide.
+//
+// The original design assumed "zod will reject an unknown `persistent`", and
+// that assumption was wrong: zod's default object behaviour STRIPS undeclared
+// keys. A live Antigravity + DSH hub run proved it —
+// `dsh_spawn_worker({ task, persistent: true })` silently ran a one-shot task
+// with `persistent: false`, and the caller only discovered it turns later.
+//
+// Two shapes would fix it, and the choice matters:
+//   * `.strict()` rejects anything undeclared, but zod's rejection surfaces as a
+//     generic McpError "Invalid arguments ..." — no stable code to branch on,
+//     and it would also reject every OTHER undeclared key, a much wider
+//     behaviour change than this defect.
+//   * DECLARING them in `inputSchema` would make `tools/list` advertise
+//     `persistent` / `session_id` as usable arguments, contradicting the tool's
+//     contract (and the tool-surface test that pins it).
+// So: keep the advertised schema as the one-shot surface, register the tool with
+// `.passthrough()` (below) so undeclared keys survive parsing instead of being
+// dropped, and refuse the two known ones here with a dedicated code.
+const spawnWorkerShape = {
+  task: z.string().describe('Full task description for the worker, self-contained — the worker has no conversation context, so include absolute paths, acceptance criteria and constraints'),
+  tier: tierSchema,
+  effort: effortSchema,
+  worker: workerSchema,
+  cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
+  allow_concurrent_cwd: allowConcurrentCwdSchema,
+  permission: permissionSchema,
+  preset: presetSchema,
+};
+
+// The registered tool's `inputSchema` is a ZodObject built from this shape by
+// the SDK. Its default behaviour strips undeclared keys BEFORE the callback
+// runs, which is what made the refusal below unreachable; `spawnWorkerTool`
+// swaps in the passthrough variant after registration (see below), so extra
+// keys survive parsing and the handler can refuse them by PRESENCE.
+const spawnWorkerTool = server.registerTool('dsh_spawn_worker', {
   title: 'Spawn DSH worker (async)',
-  description: 'Start a DSH (DeepSeek Harness) coding agent in the background and return immediately with a job id — use it to fan out several workers in parallel. The spawn response carries claims, not results: always fetch each job\'s final result later with dsh_worker_result (which parses { summary, summary_missing } and offloads large or failed outputs to report_path unless full_reply=true). Same tier guidance as dsh_run_worker: flash for mechanical, well-scoped work, pro for multi-file changes and debugging. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends the summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED). The task string must be self-contained (absolute paths, acceptance criteria, constraints) — the worker sees nothing of your conversation. worker="agy" or "grok" only when the user explicitly asks for that CLI, never a default. Guardrails refuse (never queue) origin-chain recursion and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only fan-out.',
-  inputSchema: {
-    task: z.string().describe('Full task description for the worker, self-contained — the worker has no conversation context, so include absolute paths, acceptance criteria and constraints'),
-    tier: tierSchema,
-    effort: effortSchema,
-    worker: workerSchema,
-    cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
-    allow_concurrent_cwd: allowConcurrentCwdSchema,
-    permission: permissionSchema,
-    preset: presetSchema,
-  },
-}, async ({ task, tier, effort, worker, cwd, allow_concurrent_cwd, permission, preset }) => {
+  description: 'Start a DSH (DeepSeek Harness) coding agent in the background and return immediately with a job id — use it to fan out several workers in parallel. The spawn response carries claims, not results: always fetch each job\'s final result later with dsh_worker_result (which parses { summary, summary_missing } and offloads large or failed outputs to report_path unless full_reply=true). Same tier guidance as dsh_run_worker: flash for mechanical, well-scoped work, pro for multi-file changes and debugging. Set permission ("read-only" | "workspace-write" | "auto" | "full-access") and optional preset per task; the server automatically appends the summary-block contract (read-only: VERDICT + FINDINGS; implementation: CHANGED + VERIFIED + UNVERIFIED). The task string must be self-contained (absolute paths, acceptance criteria, constraints) — the worker sees nothing of your conversation. worker="agy" or "grok" only when the user explicitly asks for that CLI, never a default. Guardrails refuse (never queue) origin-chain recursion and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only fan-out. This tool is ALWAYS one-shot: persistent sessions are only available on dsh_run_worker, and passing persistent or session_id here is refused with PERSISTENT_ASYNC_UNSUPPORTED, never silently ignored.',
+  inputSchema: spawnWorkerShape,
+}, async ({ task, tier, effort, worker, cwd, allow_concurrent_cwd, permission, preset, ...undeclared }) => {
+  // Presence, not value: `persistent: false` and `session_id: ""` are still a
+  // caller asking for async persistence, and silently degrading that to a cold
+  // one-shot job is the defect. An omitted key is absent from `undeclared`
+  // entirely, which is what keeps an ordinary fan-out dispatch unaffected.
+  if ('persistent' in undeclared || 'session_id' in undeclared) {
+    return codedRefusal(PERSISTENT_ASYNC_UNSUPPORTED, 'PERSISTENT_ASYNC_UNSUPPORTED');
+  }
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const depthLimit = depthLimitNow();
@@ -646,6 +688,14 @@ server.registerTool('dsh_spawn_worker', {
     throw err;
   }
 });
+
+// Post-registration swap, deliberately narrow: only the PARSE behaviour changes,
+// so undeclared keys reach the callback instead of being stripped. `tools/list`
+// is unaffected because `zodToJsonSchema` reads `properties`, and the advertised
+// contract stays exactly `spawnWorkerShape` — the tool still does not offer
+// persistent/session_id as usable arguments (tests/persistent-sessions-mcp
+// pins that, and it must stay true).
+spawnWorkerTool.inputSchema = z.object(spawnWorkerShape).passthrough();
 
 server.registerTool('dsh_worker_status', {
   title: 'DSH worker status',
