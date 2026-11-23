@@ -143,6 +143,24 @@ const ACL_DIRECT_PATTERNS = [
   /AclWriteGrant/i,
 ];
 
+// Win32 ACL API names that appear in a STRIPPED error message.
+//
+// `@deepseek-ai/dsh-tools` copies only `error.message` into the `tool/result`
+// event, and the hub judges ACL failure from that event — so the class name
+// (`AclWriteGrant`) that would match above lives only in the `.stack` the event
+// does not carry. A real host `Win32Error` therefore arrives as
+// `GetNamedSecurityInfoW failed (Win32 5): <path>` and matched NOTHING, which
+// meant `permission: "auto"` never degraded to a worktree on those paths.
+//
+// These names are matched ONLY in the ACL-specific shape the OS/our runner emits:
+// the API name next to a `Win32 <code>` (or a `Win32Error` name) within a short
+// window. That boundary is deliberate — a bare substring on
+// `CreateRestrictedToken` would fire on ordinary prose ("the code calls
+// CreateRestrictedToken"), and a false ACL failure silently moves a worker into a
+// throwaway worktree, which is a worse failure than not degrading.
+const ACL_WIN32_API_PATTERN = /\b(?:GetNamedSecurityInfoW|SetNamedSecurityInfoW|SetEntriesInAclW|CreateRestrictedToken)\b[\s\S]{0,80}?\bWin32\s*\d+\b/i;
+const ACL_WIN32_API_PATTERN_REVERSED = /\bWin32(?:Error)?\b\s*(?:code\s*)?[:=]?\s*\d{1,5}\b[\s\S]{0,80}?\b(?:GetNamedSecurityInfoW|SetNamedSecurityInfoW|SetEntriesInAclW|CreateRestrictedToken)\b/i;
+
 const ACL_CONTEXT_PATTERNS = [
   /(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)[\s\S]{0,240}(?:acl|windows-acl|sandbox|runner|securityinfo|win32\s*5)/i,
   /(?:acl|windows-acl|sandbox\s*runner|SANDBOX_UNAVAILABLE|Win32\s*5)[\s\S]{0,240}(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)/i,
@@ -152,7 +170,10 @@ const ACL_CONTEXT_PATTERNS = [
 
 function matchesAclText(text) {
   if (typeof text !== 'string' || text === '') return false;
-  return ACL_DIRECT_PATTERNS.some((re) => re.test(text)) || ACL_CONTEXT_PATTERNS.some((re) => re.test(text));
+  return ACL_DIRECT_PATTERNS.some((re) => re.test(text))
+    || ACL_WIN32_API_PATTERN.test(text)
+    || ACL_WIN32_API_PATTERN_REVERSED.test(text)
+    || ACL_CONTEXT_PATTERNS.some((re) => re.test(text));
 }
 
 /**
