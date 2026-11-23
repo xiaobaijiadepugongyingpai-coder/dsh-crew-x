@@ -9,3 +9,7 @@ node_modules/
 # logo design iterations stay local
 docs/images/dsh-crew-logo-v*.png
 .dsh-reports/
+
+# PowerShell module-analysis cache that a shell can drop here when it resolves
+# LOCALAPPDATA relative to the cwd; never part of the plugin.
+Microsoft/
