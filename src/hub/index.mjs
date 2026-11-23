@@ -916,6 +916,48 @@ export class WorkerRegistry {
     }
   }
 
+  /**
+   * The canonical preset id a caller's `preset` names.
+   *
+   * `"default"` is the documented way to name the host's DEFAULT preset, but the
+   * host resolves it to a real id (`standard`, `fast-coder`, …). A session whose
+   * first turn named `"default"` is therefore locked to THAT id, and a later turn
+   * that names `"default"` again is naming the very same composition — comparing
+   * the two as literal strings reported SESSION_PRESET_MISMATCH for a perfectly
+   * valid continuation.
+   *
+   * Both sides are canonicalised here, at the hub layer, because
+   * `persistent-sessions.mjs` deliberately has no service access (it is a pure,
+   * dependency-free module). The LOCKED side is already canonical: creation
+   * stores the id the service resolved, and `'default'` maps to "whatever the
+   * service says the default is" — that is the same id. So canonicalising the
+   * caller's name is enough, and `validateSessionTurnBinding` keeps comparing
+   * literal strings so it cannot be weakened by accident: a genuinely DIFFERENT
+   * real preset still resolves to a different id and still throws.
+   *
+   * Returns the trimmed literal when the hub has no preset service (then nothing
+   * could have been resolved at creation either, so the literal IS the locked
+   * value), and `null` for a blank/absent name (tolerant inheritance).
+   */
+  async canonicalPresetId(value) {
+    const wanted = nonBlank(value);
+    if (wanted === null) return null;
+    const presets = this.ctx.get('agentPresets');
+    if (presets === undefined || typeof presets.resolve !== 'function') return wanted;
+    try {
+      // `'default'` is resolved the same way creation resolves it: "the default",
+      // i.e. no explicit id at all.
+      const resolved = await presets.resolve(wanted === 'default' ? undefined : wanted);
+      return nonBlank(resolved?.id) ?? wanted;
+    } catch (err) {
+      // Resolution failing must not turn a valid continuation into a mismatch
+      // silently: fall back to the literal, which then fails closed (and loud)
+      // exactly as it did before this canonicalisation existed.
+      this.ctx.logger?.warn?.(`dsh-crew: preset ${JSON.stringify(wanted)} could not be resolved: ${err?.message ?? err}`);
+      return wanted;
+    }
+  }
+
   /** Append one turn to an existing persistent session. */
   async spawnPersistentTurn(spec = {}) {
     const sessionId = nonBlank(spec.sessionId);
@@ -935,11 +977,14 @@ export class WorkerRegistry {
       throw new HubRequestError('cwd must be an absolute path', { status: 400, code: 'INVALID_CWD' });
     }
     // cwd is locked; preset is inherited unless the caller names one explicitly.
+    // The explicit name is canonicalised through the preset service first, so
+    // `"default"` compares equal to the real id it resolved to at creation while
+    // a genuinely different preset still compares unequal.
     validateSessionTurnBinding({
       expectedCwd: rec.cwd,
       actualCwd: spec.cwd,
       expectedPreset: rec.preset,
-      explicitPreset: spec.preset,
+      explicitPreset: await this.canonicalPresetId(spec.preset),
     });
     // Reservation is synchronous: a concurrent turn cannot slip in between the
     // busy check above and this write.
@@ -1004,14 +1049,16 @@ export class WorkerRegistry {
         setup: async (agentCtx) => {
           // The persisted log is the authority on where and under what preset
           // this session ran; a mismatch means resuming would silently run the
-          // caller's task in the wrong workspace or composition.
+          // caller's task in the wrong workspace or composition. The caller's
+          // name is canonicalised first, for the same reason as on a live turn:
+          // `"default"` names the preset the log's real id resolved from.
           try {
             const session = agentCtx?.agent?.session;
             validateSessionTurnBinding({
               expectedCwd: session?.header?.cwd,
               actualCwd: cwdPath,
               expectedPreset: resolvePersistedSessionPreset(session),
-              explicitPreset: spec.preset,
+              explicitPreset: await this.canonicalPresetId(spec.preset),
             });
           } catch (err) {
             throw fail(err?.message ?? String(err));

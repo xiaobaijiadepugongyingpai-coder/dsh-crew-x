@@ -427,6 +427,75 @@ test('an omitted preset inherits the turn-1 preset even after the config default
   assert.equal(turn4.status, 'done');
 });
 
+test('an explicit preset: "default" on a follow-up is the DEFAULT preset, not a mismatch', async () => {
+  // DEFECT: `"default"` is the documented way to name the host's default preset,
+  // and the host resolves it to a REAL id at creation (here: `builtin-default`,
+  // exactly what the fake preset service does for an undefined id). The session
+  // was therefore locked to that real id, and a later turn that explicitly said
+  // `preset: "default"` compared the LITERAL string against it and threw
+  // SESSION_PRESET_MISMATCH for a perfectly valid continuation.
+  //
+  // The fix canonicalises the caller's name through the same service before the
+  // comparison, so `"default"` and the id it resolves to are the same preset —
+  // while a genuinely different preset still differs and still throws.
+  const fake = makeCtx();
+  const registry = makeRegistry(fake);
+
+  // Turn 1: created with an explicit `preset: "default"`.
+  const turn1 = await registry.spawn({ task: 'a', cwd: ISOLATED_HOME, persistent: true, preset: 'default' });
+  await turn1.promise;
+  const sessionId = turn1.sessionId;
+  assert.equal(turn1.status, 'done');
+  assert.equal(turn1.preset, 'builtin-default', 'creation locks the RESOLVED id, not the literal "default"');
+  const rec = registry.persistentSessions.get(sessionId);
+  assert.equal(rec.preset, 'builtin-default');
+
+  // Turn 2: the SAME canonical preset, named explicitly as "default". This is the
+  // case that used to throw. It must continue the SAME session/runtime.
+  const turn2 = await registry.spawn({ task: 'b', sessionId, cwd: ISOLATED_HOME, preset: 'default' });
+  await turn2.promise;
+  assert.equal(turn2.status, 'done', 'an explicit "default" continues the session instead of being refused');
+  assert.equal(turn2.preset, 'builtin-default');
+  assert.equal(fake.log.creates.length, 1, 'the follow-up reused the runtime; nothing was rebuilt');
+  assert.equal(rec.status, 'idle');
+
+  // Turn 3: a genuinely DIFFERENT preset must still be refused. The canonical
+  // comparison must not have weakened the rule into "anything about default".
+  await assert.rejects(
+    () => registry.spawn({ task: 'c', sessionId, cwd: ISOLATED_HOME, preset: 'other-preset' }),
+    (err) => err instanceof HubRequestError && err.status === 400 && err.code === 'SESSION_PRESET_MISMATCH',
+  );
+  assert.equal(fake.log.creates.length, 1, 'a refused turn built no runtime');
+  assert.equal(registry.persistentSessions.get(sessionId).status, 'idle', 'a refused turn releases the session');
+
+  // ...and the session still accepts its own default afterwards.
+  const turn4 = await registry.spawn({ task: 'd', sessionId, preset: 'default' });
+  await turn4.promise;
+  assert.equal(turn4.status, 'done');
+});
+
+test('an unresolvable preset service cannot turn "default" into a silent mismatch', async () => {
+  // The pure helper has no service access by design, so the canonicalisation
+  // lives in the hub. When the hub has NO preset service, none could have been
+  // resolved at creation either: the literal IS the locked value and must match.
+  const fake = makeCtx();
+  const ctxWithoutPresets = {
+    ...fake.ctx,
+    get(name) { return name === 'agentPresets' ? undefined : fake.ctx.get(name); },
+  };
+  const registry = new WorkerRegistry(ctxWithoutPresets, { publish() {} }, { reaperIntervalMs: 0 });
+  registry.getConfig = () => ({ preset_flash: 'flash-preset', preset_pro: 'pro-preset' });
+
+  const turn1 = await registry.spawn({ task: 'a', cwd: ISOLATED_HOME, persistent: true, preset: 'default' });
+  await turn1.promise;
+  assert.equal(turn1.preset, 'default', 'with no service the literal is what got locked');
+
+  const turn2 = await registry.spawn({ task: 'b', sessionId: turn1.sessionId, preset: 'default' });
+  await turn2.promise;
+  assert.equal(turn2.status, 'done', 'literal == literal is still an accepted continuation');
+  registry.clearTurnWatchdog(turn2);
+});
+
 test('a different cwd is refused but a differently-spelled same cwd is accepted', async () => {
   const fake = makeCtx();
   const registry = makeRegistry(fake);
@@ -623,6 +692,40 @@ test('an unknown session id resumes the persisted log once and validates its hea
   await turn2.promise;
   assert.equal(fake.log.resumes.length, 1, 'recovery happens once per session');
   assert.equal(turn2.turnIndex, 4);
+});
+
+test('a resume after a Hub restart accepts an explicit preset: "default" too', async () => {
+  // Same defect on the RECOVERY path: the persisted log records the REAL preset
+  // id the default resolved to, so a caller coming back after a hub restart with
+  // `preset: "default"` must resume, not be told its own default is a conflict.
+  const fake = makeCtx({
+    onResume({ options, buildAgent, setupCtx }) {
+      const built = buildAgent(
+        { sessionId: options.resumeSessionId, meta: { cwd: ISOLATED_HOME } },
+        { cwd: ISOLATED_HOME, agentPreset: 'builtin-default' },
+        [],
+      );
+      return options.setup(setupCtx(built)).then(() => {
+        fake.log.creates.push(built.record);
+        return { agent: built.agent, async dispose() { built.record.disposed += 1; fake.log.disposes += 1; } };
+      });
+    },
+  });
+  const registry = makeRegistry(fake);
+
+  const turn = await registry.spawn({
+    task: 'resume with default', sessionId: 'session-default-1', cwd: ISOLATED_HOME, preset: 'default',
+  });
+  await turn.promise;
+  assert.equal(turn.status, 'done', 'an explicit "default" resumes a session created under the default preset');
+  assert.equal(registry.persistentSessions.get('session-default-1').preset, 'builtin-default');
+
+  // A genuinely different preset is still refused on the recovery path.
+  await assert.rejects(
+    () => registry.spawn({ task: 'x', sessionId: 'session-default-2', cwd: ISOLATED_HOME, preset: 'other-preset' }),
+    (err) => err instanceof HubRequestError && err.code === 'SESSION_RESUME_FAILED'
+      && /SESSION_PRESET_MISMATCH|does not match/.test(err.message),
+  );
 });
 
 test('a failed resume or a header mismatch reports SESSION_RESUME_FAILED', async () => {
