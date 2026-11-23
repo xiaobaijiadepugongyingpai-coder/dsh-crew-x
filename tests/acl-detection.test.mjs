@@ -89,9 +89,21 @@ test('merely naming an ACL API is NOT an ACL failure', () => {
   ]) {
     assert.equal(detectWindowsAclFailure(prose), false, `ordinary prose must not be read as an ACL failure: ${prose}`);
   }
-  // NOTE: prose that contains a BARE `SetNamedSecurityInfoW` stays `true` — that
-  // is a pre-existing ACL_DIRECT_PATTERN and its behaviour is pinned (P1-3). The
-  // boundary added here is only about the API names that used to be absent.
+  // NOTE: the bare `SetNamedSecurityInfoW` / `AclWriteGrant` patterns were REMOVED
+  // in round 2 — they fired on source code and prose. The cases below pin that.
+  assert.equal(
+    detectWindowsAclFailure('```c\nSetNamedSecurityInfoW(p, SE_FILE_OBJECT, DACL, null, null, pDacl, null);\n```'),
+    false,
+    'a code block showing the API must not read as an ACL failure',
+  );
+  assert.equal(
+    detectWindowsAclFailure('AclWriteGrant is a helper class that grants write ACEs to the workspace SID.'),
+    false,
+    'a sentence naming the class must not read as an ACL failure',
+  );
+  assert.equal(detectWindowsAclFailure('materializeAclGrant is imported by the ACL module'), false);
+  assert.equal(detectWindowsAclFailure('SetNamedSecurityInfoW'), false);
+  assert.equal(detectWindowsAclFailure('AclWriteGrant'), false);
 
   // A bare Win32 code, or a bare API name, is not enough either.
   assert.equal(detectWindowsAclFailure('Win32 5'), false);
@@ -109,7 +121,44 @@ test('merely naming an ACL API is NOT an ACL failure', () => {
   assert.equal(detectWindowsAclFailure(cyclic), false, 'cycle-safe AND not trigger-happy');
 });
 
-// ---------- 3. the real consequence: tool/result degradation ----------
+// ---------- 2b. the marker names are matched only in an ERROR/STACK shape ----------
+
+test('AclWriteGrant / materializeAclGrant count only in an error or stack shape', () => {
+  // The host ACL package's symbols still identify a REAL failure when they appear
+  // where a failure appears: a stack frame, or beside a failure word.
+  assert.equal(detectWindowsAclFailure('AclWriteGrant.create failed: Win32 5'), true);
+  assert.equal(detectWindowsAclFailure('materializeAclGrant failed for C:\\repo'), true);
+  assert.equal(
+    detectWindowsAclFailure('    at AclWriteGrant.create (file:///D:/x/packages/windows-acl/lib/index.js:42:11)'),
+    true,
+    'a stack frame naming the class IS the real failure',
+  );
+  assert.equal(
+    detectWindowsAclFailure(new Error('grant denied', { cause: { detail: 'at materializeAclGrant (x.js:1:1)' } })),
+    true,
+    'still reachable through a nested cause',
+  );
+});
+
+// ---------- 2c. the real no-Win32-code sandbox failure ----------
+
+test('CreateRestrictedToken prerequisite failure is detected without any Win32 code', () => {
+  // From `@deepseek-ai/dsh-sandbox-windows-acl`: restricted-token creation can
+  // fail before any ACL API is reached and carries no Win32 <code> at all.
+  // Deliberate decision: this IS an ACL failure (it is the only way a restricted
+  // token cannot be built, the turn dies otherwise, and `auto` exists precisely to
+  // keep the task alive on a worktree). The match still needs the API name AND the
+  // prerequisite-failure pair, so a mention of the API alone stays non-ACL.
+  assert.equal(
+    detectWindowsAclFailure('CreateRestrictedToken prerequisite failed: no logon SID found'),
+    true,
+  );
+  assert.equal(detectWindowsAclFailure('CreateRestrictedToken prerequisite failed'), true);
+  // Strangers to that exact shape stay out.
+  assert.equal(detectWindowsAclFailure('the code calls CreateRestrictedToken'), false);
+  assert.equal(detectWindowsAclFailure('CreateRestrictedToken is imported from advapi32'), false);
+  assert.equal(detectWindowsAclFailure('prerequisite failed: missing api key'), false, 'the phrase alone is not ACL');
+});
 
 test('an auto turn degrades to a worktree when the ACL failure arrives ONLY via tool/result', async () => {
   // End-to-end for the defect: the turn never throws. The sandbox failure shows
@@ -264,4 +313,183 @@ test('auto prose-only "ACL" mention does NOT degrade a turn into a worktree', as
   assert.equal(turn.status, 'done');
   assert.equal(turn.isolation, null);
   assert.equal(turn.worktree_path, null);
+});
+
+// ---------- 4. a SUCCESSFUL turn is never degraded ----------
+
+test('a completed turn that READ a file containing ACL source text is never degraded', async () => {
+  // THE ROUND-2 BLOCKER, end to end. Two defects combined here:
+  //   1. `applyJobEvent` called detectWindowsAclFailure on the WHOLE tool/result
+  //      event, so a successful `read_file` whose OUTPUT contains
+  //      `SetNamedSecurityInfoW(...)` looked like a sandbox failure;
+  //   2. `runPersistentAttempt` degraded whenever the status was merely not
+  //      cancelled/needs_input, so a turn that then COMPLETED successfully was
+  //      still relocated into a throwaway worktree, discarding the work it had
+  //      just done in the caller's workspace.
+  // Both are now impossible: only a tool/result carrying an ERROR is inspected,
+  // and only a FAILED turn may be degraded.
+  const worktreeCalls = [];
+  const creates = [];
+
+  const buildAgent = (options) => {
+    const listeners = {};
+    const session = { header: { cwd: options.meta?.cwd }, events: [], async append() {} };
+    const emit = (type, data) => {
+      for (const fn of listeners['session/event'] ?? []) fn(session, { type, data });
+    };
+    let pending = null;
+    const agent = {
+      session,
+      id: options.sessionId,
+      async whenIdle() { await pending; },
+      followup() {
+        pending = Promise.resolve().then(() => {
+          // A SUCCESSFUL read whose output happens to contain ACL source code.
+          emit('tool/result', {
+            name: 'read_file',
+            ok: true,
+            output: '```c\nSetNamedSecurityInfoW(p, SE_FILE_OBJECT, DACL, null, null, pDacl, null);\n```',
+            content: 'AclWriteGrant is a helper class that grants write ACEs to the workspace SID.',
+          });
+          emit('assistant/message', { message: { content: [{ type: 'text', text: 'read 2 files' }] } });
+          emit('turn/end', { reason: { kind: 'completed' } });
+        });
+      },
+      cancel() {},
+    };
+    return { record: { sessionId: options.sessionId, cwd: options.meta?.cwd }, agent, listeners };
+  };
+
+  const ctx = {
+    logger: { warn() {}, info() {} },
+    get(name) {
+      if (name === 'agentPresets') return { async resolve(id) { return { id: id ?? 'builtin-default' }; }, async mount() {} };
+      return undefined;
+    },
+    sessions: { async flush() {} },
+    agents: {
+      async create(options) {
+        creates.push({ sessionId: options.sessionId, cwd: options.meta?.cwd });
+        const built = buildAgent(options);
+        await options.setup({
+          agent: { session: built.session, id: options.sessionId },
+          on(fn, handler) { (built.listeners[fn] ??= []).push(handler); },
+        });
+        return { agent: built.agent, async dispose() {} };
+      },
+    },
+  };
+  const registry = new WorkerRegistry(ctx, { publish() {} }, { reaperIntervalMs: 0 });
+  registry.getConfig = () => ({ preset_flash: 'fp', preset_pro: 'pp', flash_model: 'fm', pro_model: 'pm' });
+
+  const turn = await registry.spawn({
+    task: 'read the acl module',
+    cwd: ISOLATED_HOME,
+    permission: 'auto',
+    persistent: true,
+    turnTimeoutMs: 0,
+    createWorktree: async (args) => { worktreeCalls.push(args); throw new Error('must not be called'); },
+  });
+  await turn.promise;
+
+  assert.equal(worktreeCalls.length, 0, 'a COMPLETED turn must never be relocated into a worktree');
+  assert.equal(creates.length, 1, 'no second runtime was built');
+  assert.equal(turn.status, 'done', 'the turn completed where it ran');
+  assert.equal(turn.result, 'read 2 files');
+  assert.equal(turn.isolation, null);
+  assert.equal(turn.worktree_path, null);
+  assert.equal(turn.degraded_from, null);
+
+  // The one-shot path (same shared applyJobEvent) behaves identically.
+  const oneShotRegistry = new WorkerRegistry(ctx, { publish() {} }, { reaperIntervalMs: 0 });
+  oneShotRegistry.getConfig = () => ({ preset_flash: 'fp', preset_pro: 'pp', flash_model: 'fm', pro_model: 'pm' });
+  const oneShot = await oneShotRegistry.spawn({
+    task: 'read the acl module',
+    cwd: ISOLATED_HOME,
+    permission: 'auto',
+    createWorktree: async (args) => { worktreeCalls.push(args); throw new Error('must not be called'); },
+  });
+  await oneShot.promise;
+  assert.equal(worktreeCalls.length, 0);
+  assert.equal(oneShot.status, 'done');
+  assert.equal(oneShot.worktree_path, null);
+});
+
+test('a FAILED tool result that reports an ACL error still degrades, as before', async () => {
+  // The complement: the fix must not have disabled real degradation through the
+  // tool/result path. A FAILED turn carrying an ACL error in a failed tool result
+  // still moves to the worktree.
+  const worktreePath = join(ISOLATED_HOME, 'wt-failed-tool');
+  const worktreeCalls = [];
+  const disposes = [];
+
+  const buildAgent = (options) => {
+    const listeners = {};
+    const session = { header: { cwd: options.meta?.cwd }, events: [], async append() {} };
+    const emit = (type, data) => {
+      for (const fn of listeners['session/event'] ?? []) fn(session, { type, data });
+    };
+    let pending = null;
+    const agent = {
+      session,
+      id: options.sessionId,
+      async whenIdle() { await pending; },
+      followup() {
+        pending = Promise.resolve().then(() => {
+          if (options.sessionId.endsWith('-wt')) {
+            emit('assistant/message', { message: { content: [{ type: 'text', text: 'done in worktree' }] } });
+            emit('turn/end', { reason: { kind: 'completed' } });
+            return;
+          }
+          emit('tool/result', {
+            name: 'bash',
+            ok: false,
+            error: { name: 'Win32Error', message: 'CreateRestrictedToken prerequisite failed: no logon SID found' },
+          });
+          emit('turn/end', { reason: { kind: 'error' } });
+        });
+      },
+      cancel() {},
+    };
+    return { record: { sessionId: options.sessionId }, agent, listeners };
+  };
+  const ctx = {
+    logger: { warn() {}, info() {} },
+    get(name) {
+      if (name === 'agentPresets') return { async resolve(id) { return { id: id ?? 'builtin-default' }; }, async mount() {} };
+      return undefined;
+    },
+    sessions: { async flush() {} },
+    agents: {
+      async create(options) {
+        const built = buildAgent(options);
+        await options.setup({
+          agent: { session: built.session, id: options.sessionId },
+          on(fn, handler) { (built.listeners[fn] ??= []).push(handler); },
+        });
+        return { agent: built.agent, async dispose() { disposes.push(options.sessionId); } };
+      },
+    },
+  };
+  const registry = new WorkerRegistry(ctx, { publish() {} }, { reaperIntervalMs: 0 });
+  registry.getConfig = () => ({ preset_flash: 'fp', preset_pro: 'pp', flash_model: 'fm', pro_model: 'pm' });
+
+  const turn = await registry.spawn({
+    task: 'edit files',
+    cwd: ISOLATED_HOME,
+    permission: 'auto',
+    persistent: true,
+    turnTimeoutMs: 0,
+    createWorktree: async ({ jobId }) => {
+      worktreeCalls.push(jobId);
+      return { worktreePath, repoRoot: ISOLATED_HOME, cwd: worktreePath };
+    },
+  });
+  await turn.promise;
+
+  assert.equal(worktreeCalls.length, 1, 'a genuinely failed ACL turn still degrades');
+  assert.equal(turn.status, 'done');
+  assert.equal(turn.result, 'done in worktree');
+  assert.equal(turn.isolation, 'git-worktree');
+  registry.clearTurnWatchdog(turn);
 });

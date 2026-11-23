@@ -268,6 +268,24 @@ test('an unusable watchdog budget falls through instead of silently disabling', 
     registry.clearTurnWatchdog(job);
   }
 
+  // A boolean or an object must NOT be read as 0. `Number(false) === 0` would
+  // otherwise turn a typo into a silently disabled safety net.
+  for (const nonNumber of [false, true, {}, [], { ms: 10 }, () => 1]) {
+    const job = await registry.spawnPersistentSession({
+      task: 'non-numeric budget', cwd: ISOLATED_HOME, turnTimeoutMs: nonNumber,
+    });
+    assert.equal(job.watchdogSource, 'config', `a ${typeof nonNumber} must fall through, not disable`);
+    assert.equal(job.watchdogMs, 30_000);
+    assert.notEqual(job.watchdogTimer, null, 'the safety net is still armed');
+    registry.clearTurnWatchdog(job);
+  }
+
+  // A numeric STRING is still a usable budget (config files store strings).
+  const numericString = await registry.spawnPersistentSession({ task: 'string budget', cwd: ISOLATED_HOME, turnTimeoutMs: '45000' });
+  assert.equal(numericString.watchdogSource, 'turn');
+  assert.equal(numericString.watchdogMs, 45_000);
+  registry.clearTurnWatchdog(numericString);
+
   // An explicit 0 still disables, all the way down.
   const off = await registry.spawnPersistentSession({ task: 'off', cwd: ISOLATED_HOME, turnTimeoutMs: 0 });
   assert.equal(off.watchdogSource, 'turn');

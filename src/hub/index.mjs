@@ -88,6 +88,11 @@ const MAX_PERSISTENT_TURN_TIMEOUT_MS = 86_400_000;
 function resolveTurnTimeoutMs(candidates) {
   for (const { value, source } of candidates) {
     if (value === undefined || value === null) continue;
+    // Only a NUMBER or a NUMERIC STRING can name a budget. Without this guard
+    // `Number(false) === 0` and `Number(null) === 0` would read as an explicit
+    // "disabled", so a boolean/object typo would silently switch the safety net
+    // off — the opposite of what the caller meant.
+    if (typeof value !== 'number' && typeof value !== 'string') continue;
     // A blank string means "not configured", not "0 ms".
     if (typeof value === 'string' && value.trim() === '') continue;
     const ms = Number(value);
@@ -117,6 +122,13 @@ function countSettledTurns(session) {
  * Shared by the one-shot and persistent runners so the two views report the
  * same turn/step/tool/token numbers; `markAcl` records a Windows ACL failure
  * for the auto-worktree degradation decision.
+ *
+ * A `tool/result` can only be an ACL failure when the TOOL FAILED: a successful
+ * `read_file`/`grep` legitimately returns file content such as
+ * `SetNamedSecurityInfoW(p, SE_FILE_OBJECT, …)`, and treating that as a sandbox
+ * failure degraded a perfectly healthy turn into a throwaway worktree. So the
+ * event's own error payload is what gets inspected, never the whole event —
+ * which would also match the successful result's output text.
  */
 function applyJobEvent(job, event, markAcl) {
   switch (event?.type) {
@@ -125,10 +137,12 @@ function applyJobEvent(job, event, markAcl) {
       job.step = event.data?.step ?? job.step;
       break;
     case 'tool/call': job.currentTool = event.data?.name ?? null; job.toolCalls += 1; break;
-    case 'tool/result':
-      if (detectWindowsAclFailure(event)) markAcl();
+    case 'tool/result': {
+      const error = event.data?.error;
+      if (error !== undefined && error !== null && detectWindowsAclFailure(error)) markAcl();
       job.currentTool = null;
       break;
+    }
     case 'assistant/message': {
       const u = event.data?.usage;
       if (u) {
@@ -450,7 +464,10 @@ export class WorkerRegistry {
 
       attemptActive = false;
       const isAcl = aclDetected || detectWindowsAclFailure([job.error, job.reasonDetail]);
-      if (job.status !== 'cancelled' && job.status !== 'needs_input' && allowAutoDegrade && perm.permission === 'auto' && isAcl) {
+      // Same rule as the persistent runner: only a FAILED turn may be retried on
+      // a worktree. A completed turn already delivered its result in the
+      // caller's workspace, and relocating it would discard that.
+      if (job.status === 'failed' && allowAutoDegrade && perm.permission === 'auto' && isAcl) {
         try { await handle?.dispose(); } catch {}
         job.handle = null;
         return { aclFailed: true };
@@ -665,7 +682,12 @@ export class WorkerRegistry {
     }
 
     const isAcl = job.aclDetected === true || detectWindowsAclFailure([job.error, job.reasonDetail]);
-    if (job.status !== 'cancelled' && job.status !== 'needs_input' && allowDegrade && perm.permission === 'auto' && isAcl) {
+    // A turn that COMPLETED successfully must NEVER be degraded into a worktree:
+    // degradation discards the runtime and throws away everything the turn just
+    // produced in the caller's workspace. Only a FAILED turn may be retried
+    // elsewhere. (Before this guard, an `auto` turn that merely read a file
+    // containing ACL source text and then completed was relocated.)
+    if (job.status === 'failed' && allowDegrade && perm.permission === 'auto' && isAcl) {
       try { await handle?.dispose(); } catch {}
       if (rec.handle === handle) rec.handle = null;
       job.handle = null;
@@ -794,6 +816,10 @@ export class WorkerRegistry {
           dshSessionId: rec.dshSessionId,
           worktreePath: rec.worktreePath,
           effectiveCwd: rec.effectiveCwd,
+          // The CALLER-FACING cwd the session is locked to. Without it a restart
+          // could not re-validate the caller's workspace and would silently
+          // unlock the session (a resume with any other cwd would succeed).
+          cwd: rec.cwd,
           isolation: rec.isolation,
           degradedFrom: rec.degradedFrom,
         },
@@ -1144,6 +1170,25 @@ export class WorkerRegistry {
       // The degraded runtime has its OWN underlying session id, so the log that
       // must be resumed is the worktree one, not the caller-facing id.
       rec.dshSessionId = `${sessionId}-wt`;
+      // THE LOCKED WORKSPACE STILL APPLIES. On a degraded session the persisted
+      // log's header records the WORKTREE cwd, so the header check below cannot
+      // speak for the original workspace — the marker's `cwd` is the only record
+      // of it. Without this check a hub restart silently unlocked the session:
+      // resuming the same session_id with ANY other cwd succeeded and overwrote
+      // `rec.cwd`, where a live (non-restarted) hub correctly refused with
+      // SESSION_CWD_MISMATCH. Validated here, before any runtime is built, so a
+      // refusal costs nothing and leaves no handle behind.
+      const lockedCwd = nonBlank(persistedWorktree.facts?.cwd);
+      if (lockedCwd !== null) {
+        try {
+          validateSessionTurnBinding({ expectedCwd: lockedCwd, actualCwd: cwdPath });
+        } catch (err) {
+          throw fail(err?.message ?? String(err));
+        }
+        // Keep the record's comparison baseline on the LOCKED workspace, never on
+        // whatever cwd this particular resume request happened to carry.
+        rec.cwd = canonicalCwd(lockedCwd) ?? lockedCwd;
+      }
       this.ctx.logger?.info?.(
         `dsh-crew: resuming degraded persistent session ${sessionId} on its worktree ${persistedWorktree.worktreePath}`,
       );

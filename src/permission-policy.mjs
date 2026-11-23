@@ -136,11 +136,34 @@ export function resolveEffectivePreset({ preset, tier = 'flash', config = {} } =
   return 'default';
 }
 
+// Names that identify OUR acl runner, plus the class/function markers of the
+// host's own ACL package. Deliberately shape-scoped: a bare occurrence of
+// `SetNamedSecurityInfoW` or `AclWriteGrant` is NOT an ACL failure, because such
+// text legitimately appears in source code, documentation and tool OUTPUT — and
+// a false positive silently relocates a worker's uncommitted work into a
+// throwaway worktree.
+//
+// `/SetNamedSecurityInfoW/i` used to sit here bare. It was removed: the real
+// failure always carries a `Win32 <code>` (see ACL_WIN32_API_PATTERN), and the
+// bare form fired on a code block such as
+// `SetNamedSecurityInfoW(p, SE_FILE_OBJECT, DACL, …)` — including when a worker
+// merely READ a file containing it.
 const ACL_DIRECT_PATTERNS = [
-  /SetNamedSecurityInfoW/i,
+  // The runner's own name is specific enough to stand alone: no ordinary prose
+  // or source snippet contains `windows-acl-run` by accident.
   /windows-acl-run/i,
-  /materializeAclGrant/i,
-  /AclWriteGrant/i,
+];
+
+// The host ACL package's own symbols. Matched only in an ERROR/STACK shape:
+// a failure word next to the marker (either order), or a stack frame. A class
+// being NAMED is not a failure — "AclWriteGrant is a helper class that grants
+// write ACEs to the workspace SID." must stay false, while
+// "at AclWriteGrant.create (…)" and "AclWriteGrant.create failed: …" are real.
+const ACL_MARKER_NAMES = 'AclWriteGrant|materializeAclGrant';
+const ACL_MARKER_PATTERNS = [
+  new RegExp(`\\b(?:${ACL_MARKER_NAMES})\\b[\\s\\S]{0,80}?\\b(?:Win32|failed|failure|error|denied|EACCES|EPERM)\\b`, 'i'),
+  new RegExp(`\\b(?:failed|failure|error|denied|EACCES|EPERM)\\b[\\s\\S]{0,80}?\\b(?:${ACL_MARKER_NAMES})\\b`, 'i'),
+  new RegExp(`\\bat\\s+(?:async\\s+)?(?:new\\s+)?[\\w.$]*\\b(?:${ACL_MARKER_NAMES})\\b`, 'i'),
 ];
 
 // Win32 ACL API names that appear in a STRIPPED error message.
@@ -161,6 +184,19 @@ const ACL_DIRECT_PATTERNS = [
 const ACL_WIN32_API_PATTERN = /\b(?:GetNamedSecurityInfoW|SetNamedSecurityInfoW|SetEntriesInAclW|CreateRestrictedToken)\b[\s\S]{0,80}?\bWin32\s*\d+\b/i;
 const ACL_WIN32_API_PATTERN_REVERSED = /\bWin32(?:Error)?\b\s*(?:code\s*)?[:=]?\s*\d{1,5}\b[\s\S]{0,80}?\b(?:GetNamedSecurityInfoW|SetNamedSecurityInfoW|SetEntriesInAclW|CreateRestrictedToken)\b/i;
 
+// A real sandbox-creation failure from `@deepseek-ai/dsh-sandbox-windows-acl` that
+// carries NO `Win32 <code>` at all:
+//
+//   CreateRestrictedToken prerequisite failed: no logon SID found …
+//
+// Decision (deliberate, and tested both ways): this IS an ACL failure. It is the
+// only way a restricted token cannot be built, it fails the turn outright, and
+// `auto`'s whole purpose is to keep the task running on a worktree instead of
+// dying. The match still requires the SPECIFIC pair (the API name AND the
+// `prerequisite` failure word within a short window), so a sentence that merely
+// mentions `CreateRestrictedToken` stays non-ACL.
+const ACL_RESTRICTED_TOKEN_PREREQUISITE_PATTERN = /\bCreateRestrictedToken\b[\s\S]{0,40}?\bprerequisite\b[\s\S]{0,40}?\bfailed\b/i;
+
 const ACL_CONTEXT_PATTERNS = [
   /(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)[\s\S]{0,240}(?:acl|windows-acl|sandbox|runner|securityinfo|win32\s*5)/i,
   /(?:acl|windows-acl|sandbox\s*runner|SANDBOX_UNAVAILABLE|Win32\s*5)[\s\S]{0,240}(?:\bexit(?:\s*code)?\s*[:=]?\s*127\b|\bexitCode\b\s*[:=]\s*127\b)/i,
@@ -171,8 +207,10 @@ const ACL_CONTEXT_PATTERNS = [
 function matchesAclText(text) {
   if (typeof text !== 'string' || text === '') return false;
   return ACL_DIRECT_PATTERNS.some((re) => re.test(text))
+    || ACL_MARKER_PATTERNS.some((re) => re.test(text))
     || ACL_WIN32_API_PATTERN.test(text)
     || ACL_WIN32_API_PATTERN_REVERSED.test(text)
+    || ACL_RESTRICTED_TOKEN_PREREQUISITE_PATTERN.test(text)
     || ACL_CONTEXT_PATTERNS.some((re) => re.test(text));
 }
 

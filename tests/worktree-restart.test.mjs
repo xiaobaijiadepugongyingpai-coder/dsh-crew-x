@@ -278,6 +278,71 @@ test('a degraded session resumes on its WORKTREE after a hub restart, not the or
   assert.ok(existsSync(join(recAfter.effectiveCwd, 'uncommitted.txt')), 'the worktree work survived the restart');
 });
 
+test('a hub restart does NOT unlock the degraded session workspace', async () => {
+  // FINDING 2 (round 2 blocker). The marker originally omitted the caller's
+  // original cwd, and recovery validated the persisted header against the
+  // WORKTREE cwd instead of checking the cwd the CALLER passed. So after a
+  // restart, resuming the same session_id with a DIFFERENT cwd succeeded and
+  // overwrote the locked baseline — while before the restart the same call
+  // correctly threw SESSION_CWD_MISMATCH. A restart must not relax a lock.
+  const fake = makeCtx({ failFirstTurn: true });
+  const registry = makeRegistry(fake);
+
+  const createWorktree = async ({ jobId }) => {
+    const path = buildWorktreePath(jobId, WT_BASE);
+    created.push(path);
+    mkdirSync(path, { recursive: true });
+    return { worktreePath: path, repoRoot: ISOLATED_HOME, cwd: path };
+  };
+  const turn1 = await registry.spawn({
+    task: 'edit files', cwd: ISOLATED_HOME, permission: 'auto', persistent: true, createWorktree, turnTimeoutMs: 0,
+  });
+  await turn1.promise;
+  const sessionId = turn1.sessionId;
+  assert.equal(turn1.isolation, 'git-worktree');
+
+  // The marker records the LOCKED caller cwd, which is what recovery validates.
+  const marker = JSON.parse(readFileSync(worktreeMarkerPath(turn1.worktree_path), 'utf8'));
+  assert.equal(marker.cwd, ISOLATED_HOME, 'the locked workspace is persisted with the degradation facts');
+
+  // A live (same-process) hub refuses a different cwd — the baseline behaviour.
+  await assert.rejects(
+    () => registry.spawn({ task: 'elsewhere', sessionId, cwd: join(ISOLATED_HOME, 'other-repo') }),
+    (err) => err?.code === 'SESSION_CWD_MISMATCH',
+    'precondition: a live hub refuses a different cwd',
+  );
+
+  // ---------- the restart ----------
+  restoredSessions.set(`${sessionId}-wt`, { header: { cwd: turn1.worktree_path } });
+  const restarted = makeRegistry(fake);
+  const otherDir = join(ISOLATED_HOME, 'other-repo');
+  mkdirSync(otherDir, { recursive: true });
+
+  // Same as before the restart: a different workspace must be refused.
+  await assert.rejects(
+    () => restarted.spawn({ task: 'hijack', sessionId, cwd: otherDir, turnTimeoutMs: 0 }),
+    (err) => {
+      assert.equal(err?.code, 'SESSION_RESUME_FAILED', `expected SESSION_RESUME_FAILED, got ${err?.code}: ${err?.message}`);
+      assert.match(err.message, /does not match|cwd/i, 'the refusal explains the workspace mismatch');
+      return true;
+    },
+    'a restart must NOT unlock the session workspace',
+  );
+  assert.equal(restarted.persistentSessions.has(sessionId), false, 'the refused resume registered no record');
+  assert.equal(fake.log.resumes.length, 0, 'nothing was resumed for a refused workspace');
+
+  // The CORRECT cwd still resumes normally, and the baseline stays the original.
+  const wrongAttempts = restarted.persistentSessions.size;
+  assert.equal(wrongAttempts, 0);
+  const turn2 = await restarted.spawn({ task: 'continue', sessionId, cwd: ISOLATED_HOME, turnTimeoutMs: 0 });
+  await turn2.promise;
+  assert.equal(turn2.status, 'done', turn2.error ?? '');
+  const rec = restarted.persistentSessions.get(sessionId);
+  assert.equal(rec.cwd, ISOLATED_HOME, 'the locked baseline is the original workspace, not the worktree');
+  assert.equal(rec.effectiveCwd, turn1.worktree_path, 'the runtime still runs in the worktree');
+  assert.equal(rec.recoveredDegradation, true);
+});
+
 test('a session that never degraded still resumes on its original cwd', async () => {
   // The negative case: detection must not invent a worktree for an ordinary
   // session, or every restart would resume in the wrong place.
