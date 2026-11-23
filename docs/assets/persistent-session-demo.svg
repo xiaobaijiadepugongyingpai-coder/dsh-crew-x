@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 640" width="1100" height="640">
+  <defs>
+    <linearGradient id="term-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e1e2e" />
+      <stop offset="100%" stop-color="#181825" />
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="12" stdDeviation="20" flood-color="#000000" flood-opacity="0.5" />
+    </filter>
+  </defs>
+
+  <style>
+    .term-text {
+      font-family: ui-monospace, SFMono-Regular, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-size: 13.5px;
+      line-height: 22px;
+      fill: #cdd6f4;
+    }
+    .prompt { fill: #89b4fa; font-weight: bold; }
+    .cmd { fill: #f9e2af; }
+    .comment { fill: #6c7086; font-style: italic; }
+    .success { fill: #a6e3a1; font-weight: bold; }
+    .highlight { fill: #fab387; font-weight: bold; }
+    .purple { fill: #cba6f7; }
+    .cyan { fill: #89dceb; }
+
+    /* CSS Animations for Step-by-Step Terminal Playback */
+    @keyframes step1Fade {
+      0% { opacity: 0; }
+      4% { opacity: 1; }
+      96% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    @keyframes step2Fade {
+      0%, 32% { opacity: 0; }
+      36% { opacity: 1; }
+      96% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    @keyframes step3Fade {
+      0%, 65% { opacity: 0; }
+      69% { opacity: 1; }
+      96% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+
+    .step1 { animation: step1Fade 15s infinite; }
+    .step2 { animation: step2Fade 15s infinite; }
+    .step3 { animation: step3Fade 15s infinite; }
+
+    @keyframes cursorBlink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    .cursor { animation: cursorBlink 0.9s infinite; fill: #f5e0dc; }
+  </style>
+
+  <!-- Outer Canvas Background -->
+  <rect width="1100" height="640" rx="16" fill="#11111b" />
+
+  <!-- Terminal Window with Shadow -->
+  <g transform="translate(40, 30)" filter="url(#shadow)">
+    <!-- Window Frame -->
+    <rect width="1020" height="580" rx="12" fill="url(#term-bg)" stroke="#313244" stroke-width="1.5" />
+    
+    <!-- Titlebar -->
+    <rect width="1020" height="40" rx="12" fill="#181825" />
+    <rect y="26" width="1020" height="14" fill="#181825" />
+    <line x1="0" y1="40" x2="1020" y2="40" stroke="#313244" stroke-width="1" />
+    
+    <!-- Window Controls -->
+    <circle cx="22" cy="20" r="6" fill="#f38ba8" />
+    <circle cx="42" cy="20" r="6" fill="#f9e2af" />
+    <circle cx="62" cy="20" r="6" fill="#a6e3a1" />
+    
+    <text x="510" y="25" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="12.5" fill="#a6adc8" font-weight="500">
+      dsh-crew-x &mdash; Opt-In Persistent Session Flow (1:1 Subagent Binding)
+    </text>
+
+    <!-- Terminal Content Area -->
+    <g transform="translate(30, 70)" class="term-text">
+      
+      <!-- STEP 1: Create Session -->
+      <g class="step1">
+        <text y="0"><tspan class="prompt">guest@dsh-host:~/repo$</tspan> <tspan class="comment"># [Turn 1] Start an Opt-in Persistent DSH Session</tspan></text>
+        <text y="24"><tspan class="prompt">&gt;</tspan> <tspan class="cmd">dsh_run_worker({ task: "Investigate timeout in auth module", tier: "pro", </tspan><tspan class="purple">persistent: true</tspan><tspan class="cmd"> })</tspan></text>
+        <text y="50" class="cyan">[hub] Session pool: initialized worker session with pro preset</text>
+        <text y="74" class="cyan">[hub] Appended sandbox/mode: "workspace-write", CWD locked to /home/guest/repo</text>
+        <text y="98"><tspan class="success">✓ Turn 1 settled in 3.4s</tspan> &middot; <tspan class="highlight">session_id: "session-9b1c-4f8a"</tspan> &middot; <tspan class="comment">turnIndex: 1</tspan></text>
+        <text y="122" fill="#bac2de">  Verdict: Found race condition in JWT refresher (token expiration edge condition).</text>
+        <text y="146" class="comment">---------------------------------------------------------------------------------------------------------</text>
+      </g>
+
+      <!-- STEP 2: Follow-up Turn -->
+      <g class="step2">
+        <text y="176"><tspan class="prompt">guest@dsh-host:~/repo$</tspan> <tspan class="comment"># [Turn 2] Follow-up turn on the SAME session (context inherited!)</tspan></text>
+        <text y="200"><tspan class="prompt">&gt;</tspan> <tspan class="cmd">dsh_run_worker({ </tspan><tspan class="highlight">session_id: "session-9b1c-4f8a"</tspan><tspan class="cmd">, task: "Apply mutex fix and run test suite" })</tspan></text>
+        <text y="226" class="cyan">[hub] Reusing session "session-9b1c-4f8a" (turnEpoch: 2, preset: "default" inherited)</text>
+        <text y="250" class="cyan">[hub] Watchdog budget: 180s (caller timeout + grace) &middot; conversation intact</text>
+        <text y="274"><tspan class="success">✓ Turn 2 settled in 2.1s</tspan> &middot; <tspan class="comment">turnIndex: 2</tspan> &middot; <tspan fill="#a6e3a1">All 14 tests passing</tspan></text>
+        <text y="298" fill="#bac2de">  Summary: Added async mutex lock to refreshSession(); verified zero AST regressions.</text>
+        <text y="322" class="comment">---------------------------------------------------------------------------------------------------------</text>
+      </g>
+
+      <!-- STEP 3: Explicit Close -->
+      <g class="step3">
+        <text y="352"><tspan class="prompt">guest@dsh-host:~/repo$</tspan> <tspan class="comment"># [Turn 3] Subagent finishes &amp; cleanly destroys the session</tspan></text>
+        <text y="376"><tspan class="prompt">&gt;</tspan> <tspan class="cmd">dsh_session_close({ </tspan><tspan class="highlight">session_id: "session-9b1c-4f8a"</tspan><tspan class="cmd"> })</tspan></text>
+        <text y="402" class="cyan">[hub] Disposed session agent handle &middot; CWD lock released &middot; tombstone registered</text>
+        <text y="426"><tspan class="success">✓ Session closed:</tspan> <tspan fill="#bac2de">{ ok: true, closed: true, session_id: "session-9b1c-4f8a" }</tspan></text>
+        <text y="450" class="comment"># Subsequent calls to this session_id will safely return SESSION_CLOSED.</text>
+        <text y="480"><tspan class="prompt">guest@dsh-host:~/repo$</tspan> <rect x="200" y="466" width="9" height="18" class="cursor" /></text>
+      </g>
+
+    </g>
+  </g>
+</svg>

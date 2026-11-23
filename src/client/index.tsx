@@ -101,8 +101,8 @@ function useWorkspaceCollapse(wsKey: string): [boolean, () => void] {
 
 const COPY = {
   zh: {
-    label: 'DSH Crew',
-    title: 'DSH Crew',
+    label: 'DSH Crew X',
+    title: 'DSH Crew X',
     intro: '把 Claude Code / Codex 的子任务派给本实例的 DSH agent，在宿主里显示为原生子代理、进度可见。配置派发默认值、执行方式，以及接入视觉与生图能力，一键装进宿主。',
     integrations: '集成',
     collapse: '折叠', expand: '展开',
@@ -258,8 +258,8 @@ const COPY = {
     sessionGroupTurns: (n: number) => `${n} 轮`,
   },
   en: {
-    label: 'DSH Crew',
-    title: 'DSH Crew',
+    label: 'DSH Crew X',
+    title: 'DSH Crew X',
     intro: 'Dispatch Claude Code / Codex subtasks to DSH agents within this instance, displayed as native subagents in the host with live progress. Configure dispatch defaults, execution mode, and vision/image generation (via subscription CLI or your own OpenAI API), then one-click install into the host.',
     integrations: 'Integrations',
     collapse: 'Collapse', expand: 'Expand',

@@ -39,7 +39,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PKG_NAME = '@zseven-w/dsh-crew';
+const PKG_NAME = 'dsh-crew-x';
 const EXPECTED_TOOLS = [
   'dsh_run_worker',
   'dsh_worker_config',
@@ -168,7 +168,7 @@ async function handshake(serverRel, label) {
   console.log('--- initialize response (raw) ---');
   console.log(responses[responses.length - 1]);
   const info = init.result && init.result.serverInfo;
-  if (!info || info.name !== 'dsh-crew') fail(label + ': serverInfo.name is ' + JSON.stringify(info && info.name) + ', expected dsh-crew');
+  if (!info || info.name !== 'dsh-crew-x') fail(label + ': serverInfo.name is ' + JSON.stringify(info && info.name) + ', expected dsh-crew-x');
 
   send({ jsonrpc: '2.0', method: 'notifications/initialized' });
 

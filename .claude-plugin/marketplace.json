@@ -1,14 +1,14 @@
 {
-  "name": "dsh-crew",
+  "name": "dsh-crew-x",
   "owner": {
-    "name": "ZSeven-W"
+    "name": "xiaobaijiadepugongyingpai-coder"
   },
-  "description": "Dispatch subtasks to DeepSeek Harness (DSH) agents as native subagents with live progress",
+  "description": "Production-grade DeepSeek Harness (DSH) worker orchestrator: dispatch work to native subagents with live progress, persistent sessions, per-task permissions, and Windows worktree isolation",
   "plugins": [
     {
-      "name": "dsh-crew",
+      "name": "dsh-crew-x",
       "source": "./",
-      "description": "Dispatch subtasks to DeepSeek Harness (DSH) agents as native subagents with live progress",
+      "description": "Production-grade DeepSeek Harness (DSH) worker orchestrator: dispatch work to native subagents with live progress, persistent sessions, per-task permissions, and Windows worktree isolation",
       "category": "productivity"
     }
   ]

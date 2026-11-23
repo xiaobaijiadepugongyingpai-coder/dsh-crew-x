@@ -153,7 +153,7 @@ try {
   console.log('--- initialize response (raw) ---');
   console.log(responses[responses.length - 1]);
   if (!init.result || !init.result.protocolVersion) fail('initialize result missing protocolVersion');
-  if (!init.result.serverInfo || init.result.serverInfo.name !== 'dsh-crew') fail('initialize serverInfo.name is ' + JSON.stringify(init.result && init.result.serverInfo && init.result.serverInfo.name) + ', expected dsh-crew');
+  if (!init.result.serverInfo || init.result.serverInfo.name !== 'dsh-crew-x') fail('initialize serverInfo.name is ' + JSON.stringify(init.result && init.result.serverInfo && init.result.serverInfo.name) + ', expected dsh-crew-x');
   console.log('[smoke:mcp] initialize OK: protocolVersion=' + init.result.protocolVersion + ', serverInfo=' + JSON.stringify(init.result.serverInfo));
 
   // Per the MCP spec the client must announce readiness before other calls.

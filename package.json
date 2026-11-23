@@ -1,9 +1,14 @@
 {
-  "name": "@zseven-w/dsh-crew",
-  "version": "0.1.0-rc.15",
+  "name": "dsh-crew-x",
+  "version": "0.2.0",
   "type": "module",
   "main": "./src/hub/index.mjs",
-  "description": "DeepSeek Harness plugin: dispatch work to DSH agents from Claude Code / Codex, as native subagents with live progress",
+  "description": "Production-grade DeepSeek Harness (DSH) worker orchestrator: dispatch work to native subagents with live progress, persistent sessions, per-task permissions, and Windows worktree isolation",
+  "author": "xiaobaijiadepugongyingpai-coder <xiaobaijiadepugongyingpai@gmail.com>",
+  "homepage": "https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x#readme",
+  "bugs": {
+    "url": "https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -96,15 +101,21 @@
   "packageManager": "pnpm@11.21.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ZSeven-W/dsh-crew.git"
+    "url": "git+https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x.git"
   },
   "keywords": [
     "dsh",
     "deepseek",
+    "deepseek-harness",
     "claude-code",
     "codex",
+    "antigravity",
+    "grok",
     "subagent",
     "worker",
+    "mcp",
+    "persistent-sessions",
+    "windows-worktree",
     "multimodal",
     "plugin",
     "agent"
@@ -113,6 +124,8 @@
     "lib",
     "src",
     "scripts",
+    "!scripts/capture-ui.mjs",
+    "!scripts/demo-persistent.tape",
     "agents",
     "commands",
     "codex",
@@ -125,6 +138,7 @@
     ".mcp.json",
     "README.md",
     "README.*.md",
+    "CHANGELOG.md",
     "docs/images/dsh-crew-logo.png",
     "docs/images/dsh-crew-overview.png",
     "docs/images/dsh-crew-host.png",

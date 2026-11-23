@@ -3,8 +3,19 @@ node_modules/
 *.log
 .DS_Store
 
-# Local machine state, never part of the plugin:
-# credentials live in ~/.config/dsh-crew/.env
+# Local machine state & credentials:
+.env
+.env.*
+*.env
+!.env.example
+
+# Local machine & agent handoff docs
+AI_HANDOFF.md
+DSH_CREW_GUIDE_AND_WORKFLOW.md
+AGENTS.md
+CLAUDE.md
+.claude/
+.gitnexus/
 
 # logo design iterations stay local
 docs/images/dsh-crew-logo-v*.png
@@ -13,3 +24,13 @@ docs/images/dsh-crew-logo-v*.png
 # PowerShell module-analysis cache that a shell can drop here when it resolves
 # LOCALAPPDATA relative to the cwd; never part of the plugin.
 Microsoft/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS temporary files
+Thumbs.db
+Desktop.ini
