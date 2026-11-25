@@ -1,8 +1,10 @@
-# DSH Crew X (`dsh-crew-x`)
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="DSH Crew X — DeepSeek Harness Worker Orchestrator" width="100%" />
+</p>
 
 <p align="center">
-  <strong>Production-Grade DeepSeek Harness (DSH) Worker Orchestrator</strong><br />
-  Long-lived Persistent Sessions &middot; Dynamic Port Hot Reconnect &middot; Per-Task Fine-Grained Permissions &middot; Windows Worktree Isolation &middot; Large Output Auto-Offload
+  <strong>Production-Grade <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> Worker Orchestrator</strong><br />
+  <sub>Opt-In Persistent Sessions &bull; Dynamic Hub Discovery &bull; 4-Tier Per-Task Permissions &bull; Windows Auto-Worktree &bull; Threshold Auto-Offload</sub>
 </p>
 
 <p align="center">
@@ -11,124 +13,142 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/dsh-crew-x"><img src="https://img.shields.io/npm/v/dsh-crew-x?color=2563eb" alt="npm version" /></a>
-  <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A518.0.0-blue.svg" alt="Node.js" /></a>
-  <a href="https://github.com/ZSeven-W/dsh-crew"><img src="https://img.shields.io/badge/Forked%20from-ZSeven--W%2Fdsh--crew-orange" alt="Forked from ZSeven-W/dsh-crew" /></a>
+  <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/releases"><img src="https://img.shields.io/github/v/release/xiaobaijiadepugongyingpai-coder/dsh-crew-x?include_prereleases&color=2563eb&label=release" alt="GitHub Release" /></a>
+  <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-16a34a.svg" alt="License: MIT" /></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A518.0.0-2563eb.svg" alt="Node.js >= 18" /></a>
+  <img src="https://img.shields.io/badge/MCP-8%20Tools-7c3aed.svg" alt="8 MCP Tools" />
+  <a href="https://github.com/ZSeven-W/dsh-crew"><img src="https://img.shields.io/badge/Forked%20from-ZSeven--W%2Fdsh--crew-ea580c" alt="Forked from ZSeven-W/dsh-crew" /></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/hero-settings.png" alt="DSH Crew X Settings Panel & Jobs Board" width="100%" />
+  <a href="#-key-differences-from-upstream">vs Upstream</a> &bull;
+  <a href="#-production-workflows">Workflows</a> &bull;
+  <a href="#-quick-start">Quick Start</a> &bull;
+  <a href="#-architecture--mcp-reference">Architecture &amp; Tools</a> &bull;
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---
 
-## 📖 Open Source Acknowledgements & Fork Notice
+## 🖥️ Control Plane & Live Orchestration
 
-This project is hard forked from [ZSeven-W/dsh-crew](https://github.com/ZSeven-W/dsh-crew) under the terms of the MIT License.
+`dsh-crew-x` mounts directly into the **DSH Settings Panel** as both a visual configuration center and a live multi-workspace jobs board:
 
-- **Upstream Credit**: Special thanks to `ZSeven-W` for creating and architecting the clean, elegant DSH subagent protocol and three-surface framework.
-- **Divergence & Evolution**:
-  - **Upstream Project**: Focused on keeping the core clean, lightweight, and strictly stateless (one-shot), maintaining minimal DSH settings panel options and Hub configs.
-  - **DSH Crew X**: Tailored specifically for **heavy-duty production engineering and multi-agent enterprise workflows**. It addresses complex multi-turn collaboration, large-scale concurrent code audits, Windows enterprise security hurdles, and context window exhaustion by introducing persistent session pools, automatic worktree isolation, result offloading, and deep stability hardening.
+<p align="center">
+  <img src="docs/assets/hero-dispatch-en.png" alt="DSH Crew X Dispatch Policy & Tier Model Bindings" width="100%" />
+</p>
+<p align="center"><sub>Visual <code>flash</code> / <code>pro</code> provider &amp; model bindings with one-click no-op tool-call route verification</sub></p>
+
+<p align="center">
+  <img src="docs/assets/hero-sessions-en.png" alt="DSH Crew X Active Persistent Sessions & Worker Jobs Board" width="100%" />
+</p>
+<p align="center"><sub>Live persistent session pool (with Windows ACL <code>worktree</code> degradation badges) &amp; per-workspace jobs grouping (<code>↻ session #turn</code> &amp; <code>🔒</code> CWD lock)</sub></p>
+
+---
+
+## 📖 Fork Context & Upstream Credit
+
+This repository is a hard fork of [**ZSeven-W/dsh-crew**](https://github.com/ZSeven-W/dsh-crew) (`0.1.0-rc.15`, MIT License).
+
+- **Upstream Credit**: Full credit to `ZSeven-W` for designing the clean three-surface DSH subagent protocol (`Host ↔ MCP ↔ DSH Hub`).
+- **Why `dsh-crew-x` Exists**: Upstream keeps execution strictly stateless and minimal. `dsh-crew-x` is engineered for **heavy-duty, multi-turn, and Windows enterprise workflows**—adding opt-in persistent sessions, dynamic port discovery for DSH Desktop, per-task sandboxing with automatic Windows Git Worktree fallback, and threshold-based report offloading.
 
 ---
 
 ## ⚡ Key Differences from Upstream
 
-| Dimension | Upstream `ZSeven-W/dsh-crew` | Enhanced `dsh-crew-x` | Practical Benefits |
+| Capability | Upstream `ZSeven-W/dsh-crew` | Enhanced `dsh-crew-x` | Practical Impact |
 |---|---|---|---|
-| **Session Model** | Purely stateless (one-shot); all context discarded upon task completion | **Opt-In Persistent Sessions**<br>1:1 forwarding subagent binding with idle reaper & turn watchdog | Eliminates repeated file re-reads & token wastage in iterative multi-turn bug-fixing |
-| **Connection & Discovery** | Fixed loopback port (default `3080`); crashes with `ECONNREFUSED` on port changes | **Atomic File Discovery (`hub.json`) + CAS Hot Reconnect** | Perfect for DSH Desktop dynamic random ports; reconnects seamlessly after restarts |
-| **Model Routing** | Hand-edited `config.json` without validation or live feedback | **Visual Dropdowns + Custom ID Input + Real Tool-Call Probe Button** | Live inspection of registered providers & instant no-op tool-call route verification |
-| **Sandbox & Permissions** | Static global mode; restricted Windows directories crash with `Win32 5 Access Denied` | **4-Tier Per-Task Permissions + Ceiling + Windows Auto-Worktree Fallback** | Least-privilege execution; auto-degrades to isolated Git Worktree on Windows ACL issues without failing |
-| **Output Management** | Entire 10,000+ token reviews returned inline, easily overflowing context windows | **Threshold Auto-Offload (`<cwd>/.dsh-reports/`) + Structured Summary Contract** | Saves 85%+ context window space; extracts structured `VERDICT` / `CHANGED` findings |
-| **Concurrency & Locks** | Shared workspace (CWD) strictly serialized | **Exclusive Write Locks + Concurrent Read-Only Dispatches (`allow_concurrent_cwd`)** | Enables running multiple parallel Flash workers for rapid multi-module code audits |
+| **Session Lifecycle** | Strictly stateless (one-shot); context discarded every turn | **Opt-In Persistent Sessions (`persistent: true`)**<br>1:1 binding, idle reaper (`1–1440m`), turn-level watchdog (`turnEpoch`) | Eliminates redundant repo re-reads and token waste in multi-turn debugging |
+| **Hub Discovery** | Static loopback port (`3080`); breaks on port change | **Atomic `hub.json` Discovery + CAS Hot Reconnect** | Works seamlessly with DSH Desktop's randomized ports across restarts |
+| **Model Routing** | Manual `config.json` edits with no live validation | **Visual Catalog Dropdowns + Custom IDs + Route Probe** | Enumerates live DSH providers and tests real tool-call capability in one click |
+| **Sandbox & Windows ACL** | Global mode; restricted paths fail with `Win32 5 Access Denied` | **4-Tier Per-Task Permissions + Ceiling + Auto-Worktree** | Least-privilege per task; auto-degrades to `%TEMP%\dsh-crew-worktrees` on ACL failure |
+| **Output Management** | Full multi-thousand-token output inlined into host chat | **Auto-Offload (`<cwd>/.dsh-reports/`) + Summary Contract** | Saves 85%+ host context window while extracting `VERDICT` / `CHANGED` blocks |
+| **Workspace Concurrency** | One worker per directory at a time | **Exclusive Write Lock + `allow_concurrent_cwd` for Reads** | Run multiple parallel `flash` read-only auditors in the same repo safely |
 
 ---
 
-## 🎯 Three Real-World Production Scenarios
+## 🎯 Production Workflows
 
-### Scenario 1: Large-Scale Concurrent Code Auditing (Parallel Reads + Auto-Offload)
+### 1. Parallel Code Auditing Without Context Bloat
 
 <p align="center">
-  <img src="docs/assets/report-offload-compare.svg" alt="Result Offload Comparison" width="95%" />
+  <img src="docs/assets/report-offload-compare.svg" alt="Unbounded Inline vs Threshold Auto-Offload" width="96%" />
 </p>
 
-- **Problem**: In standard workflows, a single workspace can only run one worker at a time; deep security audits returning tens of thousands of tokens quickly overwhelm Claude, Codex, or Antigravity context windows.
-- **Solution**: Spawn multiple read-only workers concurrently by setting `allow_concurrent_cwd: true` and `permission: "read-only"`. Excessive outputs are automatically saved to disk, returning only structured summaries.
+Dispatch multiple `read-only` workers concurrently against the same repository (`allow_concurrent_cwd: true`). Any output exceeding `inline_limit` (default `1500` tokens / `4000` chars) or ending in a non-`done` state is automatically saved to `<cwd>/.dsh-reports/` (with `.gitignore` managed idempotently), returning only the parsed structured summary to the host:
 
-```javascript
-// Worker 1: Audit auth module
-dsh_spawn_worker({
-  task: "Audit src/auth for JWT refresh replay vulnerabilities",
-  tier: "flash",
-  permission: "read-only",
-  allow_concurrent_cwd: true
-});
+```json
+// MCP tool call: dsh_spawn_worker (Worker 1 — Auth Audit)
+{
+  "task": "Audit src/auth for JWT refresh replay vulnerabilities",
+  "tier": "flash",
+  "permission": "read-only",
+  "allow_concurrent_cwd": true
+}
+```
 
-// Worker 2: Concurrently audit database queries without blocking
-dsh_spawn_worker({
-  task: "Audit src/db for SQL injection risks and slow query patterns",
-  tier: "flash",
-  permission: "read-only",
-  allow_concurrent_cwd: true
-});
+```json
+// MCP tool call: dsh_spawn_worker (Worker 2 — DB Audit, runs concurrently)
+{
+  "task": "Audit src/db for SQL injection risks and unindexed queries",
+  "tier": "flash",
+  "permission": "read-only",
+  "allow_concurrent_cwd": true
+}
 ```
 
 ---
 
-### Scenario 2: Multi-Turn Iterative Bug Fixing (Persistent Session Mode)
+### 2. Multi-Turn Iterative Debugging (Persistent Sessions)
 
 <p align="center">
-  <img src="docs/assets/persistent-session-demo.svg" alt="Persistent Session Demo" width="95%" />
+  <img src="docs/assets/persistent-session-demo.svg" alt="Persistent Session Lifecycle" width="96%" />
 </p>
 
-- **Problem**: Complex issues require an iterative loop: root-cause analysis ➔ reproduction test ➔ code fix ➔ regression check. In a stateless model, each turn forces the worker to read the entire codebase all over again.
-- **Solution**: Bind a long-lived persistent session to carry forward full memory, tool results, and reasoning chains.
+Available in **DSH Hub + Antigravity** (opt-in via DSH Settings or `dsh_worker_config({ persistent_sessions: true })`). A forwarding subagent binds 1:1 to a DSH Hub session across turns and explicitly tears it down when done:
 
-```javascript
-// Turn 1: Launch persistent session for root cause investigation
-const step1 = await dsh_run_worker({
-  task: "Diagnose why unit test #104 occasionally times out in src/hub/index.mjs",
-  tier: "pro",
-  persistent: true
-});
-// ➜ Returns session_id: "session-9b1c-4f8a" with the root cause explanation
+```json
+// Turn 1 — Create persistent session
+// Tool: dsh_run_worker
+{
+  "task": "Diagnose why test #104 intermittently times out in src/hub/index.mjs",
+  "tier": "pro",
+  "persistent": true
+}
+// -> Returns session_id: "sess-9b1c-4f8a", turnIndex: 1
+```
 
-// Turn 2: Continue in the same session to write the fix (inherits all Turn 1 context)
-const step2 = await dsh_run_worker({
-  session_id: "session-9b1c-4f8a",
-  task: "Apply the mutex lock fix we discussed in turn 1 and run the unit test suite"
-});
+```json
+// Turn 2 — Continue on the same session (full history & tool outputs preserved)
+// Tool: dsh_run_worker
+{
+  "session_id": "sess-9b1c-4f8a",
+  "task": "Apply the turnEpoch guard we identified and run the test suite"
+}
+```
 
-// Turn 3: Work complete, destroy the session explicitly
-await dsh_session_close({
-  session_id: "session-9b1c-4f8a"
-});
+```json
+// Turn 3 — Explicit teardown (registers tombstone; future reuse returns SESSION_CLOSED)
+// Tool: dsh_session_close
+{
+  "session_id": "sess-9b1c-4f8a"
+}
 ```
 
 ---
 
-### Scenario 3: Windows Desktop Zero-Config Plug-and-Play (Dynamic Discovery + Auto-Worktree)
+### 3. Windows Desktop Zero-Config & ACL Fallback
 
-- **Problem**: DSH Desktop generates a randomized port on every startup; modifying protected branches or restricted paths triggers Windows `Win32 5 Access Denied` errors.
-- **Solution**:
-  1. The Hub broadcasts its live port to `~/.config/dsh-crew/hub.json`, and the MCP client performs CAS-governed automatic failover.
-  2. Tasks defaulting to `permission: "auto"` gracefully transition to a clean temporary Git Worktree at `%TEMP%\dsh-crew-worktrees\<id>` upon encountering ACL limitations, surviving DSH restarts seamlessly.
+- **Dynamic Port Hot-Reconnect**: On boot and on loopback requests, the DSH Hub atomically writes its live URL and PID to `~/.config/dsh-crew/hub.json`. The MCP client resolves live candidates via CAS-protected failover—surviving DSH Desktop restarts with zero manual config.
+- **Resilient `auto` Worktree Degradation**: Tasks using `permission: "auto"` execute with `workspace-write`. If Windows restricts directory ACLs (`SetNamedSecurityInfoW` / `Win32 5`), the Hub automatically provisions an isolated Git Worktree under `%TEMP%\dsh-crew-worktrees\<id>` with `.degradation.json` sidecar metadata—keeping external `session_id` and `cwd` validation intact across restarts.
 
 ---
 
-## 🚀 Quick Start & Integration
+## 🚀 Quick Start
 
-### 1. Installation
+### 1. Clone & Build
 
-#### Option A: Install from npm
-```bash
-npm install -g dsh-crew-x
-```
-
-#### Option B: Build from Source
 ```bash
 git clone https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x.git
 cd dsh-crew-x
@@ -136,30 +156,41 @@ pnpm install
 npm run build
 ```
 
-### 2. Connect External AI Hosts
+### 2. Mount Plugin into DSH
 
-`dsh-crew-x` includes an installer CLI to configure external coding assistants in one command:
+Link the built repository into your DSH profile (recommended for Hub mode):
 
 ```bash
-# Register all supported hosts (Claude Code, Codex, Antigravity, Grok)
+dsh plugin --profile web add link:/path/to/dsh-crew-x
+dsh web
+```
+
+> **Standalone Fallback Only**: When no DSH instance is running, workers can fall back to standalone execution if `DEEPSEEK_API_KEY` is configured in `~/.config/dsh-crew/.env` (see `.env.example`).
+
+### 3. Connect External AI Hosts
+
+Use the built-in installer CLI to register the MCP server, role definitions, skills, and permissions:
+
+```bash
+# Install all 4 supported hosts (Claude Code, Codex, Antigravity, Grok)
 node src/install/cli.mjs all
 
-# Or configure specific hosts:
-node src/install/cli.mjs agy --agy-permissions=safe  # Antigravity (auto-allows safe query tools)
-node src/install/cli.mjs claude --statusline        # Claude Code (with optional statusline)
-node src/install/cli.mjs codex                      # OpenAI Codex
+# Or install individual hosts:
+node src/install/cli.mjs agy --agy-permissions=safe  # Antigravity (auto-allows 4 safe query tools)
+node src/install/cli.mjs claude --statusline        # Claude Code (with claude-hud status segment)
+node src/install/cli.mjs codex                      # OpenAI Codex CLI
 node src/install/cli.mjs grok                       # Grok Build CLI
 ```
 
 > [!WARNING]
-> **Migration Notices & Breaking Changes**:
-> 1. **Do Not Mix**: Avoid running upstream `@zseven-w/dsh-crew` and `dsh-crew-x` simultaneously within the same host to prevent MCP tool name collisions.
-> 2. **Async Persistent Refusal**: `dsh_spawn_worker` strictly operates in one-shot mode. Passing `persistent: true` or `session_id` will be explicitly refused with `PERSISTENT_ASYNC_UNSUPPORTED` (upstream silently stripped unknown fields).
-> 3. **Windows Worktree Signals**: When an `auto` task triggers an ACL degradation, the response payload explicitly includes `worktree_path` and `isolation: true`.
+> **Migration & Breaking Changes**:
+> 1. **Do Not Mix**: Never enable upstream `@zseven-w/dsh-crew` and `dsh-crew-x` simultaneously in the same host—MCP tool names will collide.
+> 2. **Async Persistent Refusal**: `dsh_spawn_worker` strictly runs in one-shot mode. Passing `persistent` or `session_id` (even `false` or `""`) is explicitly rejected with `PERSISTENT_ASYNC_UNSUPPORTED`.
+> 3. **Worktree Metadata**: When an `auto` task triggers Windows ACL fallback, the response explicitly includes `worktree_path` and `isolation: true`.
 
 ---
 
-## 🏗️ Architecture & Interface Reference
+## 🏗️ Architecture & MCP Reference
 
 ```mermaid
 flowchart LR
@@ -169,25 +200,25 @@ flowchart LR
 
   subgraph MCP["MCP Stdio Server (lib/server.mjs)"]
     Router["Tool Dispatch & Validation"]
-    CwdLock["Workspace Read/Write Mutex"]
-    Policy["4-Tier Sandbox Permission Policy"]
+    CwdLock["Workspace CWD Advisory Lock"]
+    Policy["4-Tier Permission Policy"]
     Summary["Structured Summary Contract"]
-    Offload["Large Output Auto-Offload (.dsh-reports/)"]
-    HubCli["Dynamic Discovery & Hot Reconnect Client"]
+    Offload["Threshold Offload (.dsh-reports/)"]
+    HubCli["Dynamic Discovery & CAS Client"]
   end
 
   subgraph Hub["DSH Hub Plugin (src/hub/index.mjs)"]
     Http["Loopback HTTP API (/_dsh/dsh-crew/*)"]
     PortDisc["hub.json Live Port Broadcast"]
-    SessionPool["Persistent Session Pool (WorkerRegistry)"]
-    Reaper["Idle Session Automatic Reaper"]
-    Watchdog["Turn-Level Watchdog (turnEpoch)"]
+    SessionPool["Persistent Session Pool"]
+    Reaper["Idle Session Reaper"]
+    Watchdog["Turn Watchdog (turnEpoch)"]
   end
 
   subgraph UI["DSH Settings Web UI (lib/client.js)"]
-    ModelUI["Flash/Pro Visual Selector & Route Probe"]
-    SessionUI["Active Session Monitor & Close Button"]
-    JobsUI["Aggregated Jobs Board & Lock Indicator"]
+    ModelUI["Tier Visual Selector & Probe"]
+    SessionUI["Active Session Monitor"]
+    JobsUI["Per-Workspace Jobs Board"]
   end
 
   Orch -->|"MCP stdio"| MCP
@@ -195,41 +226,51 @@ flowchart LR
   UI -->|"Loopback Fetch"| Http
 ```
 
-### 🛠️ 8 MCP Tools Reference
+### 🛠️ 8 MCP Tools
 
-| Tool Name | Purpose | Key Parameters |
+| Tool | Role | Key Parameters |
 |---|---|---|
-| `dsh_run_worker` | Blocking execution (supports persistent session) | `task`, `tier`, `effort`, `permission`, `preset`, `persistent`, `session_id`, `inline_limit`, `full_reply` |
-| `dsh_spawn_worker` | Asynchronous background dispatch | `task`, `tier`, `effort`, `permission`, `preset`, `allow_concurrent_cwd` |
-| `dsh_worker_status` | Inspect live task progress & CWD advisory locks | None |
-| `dsh_worker_result` | Retrieve settled task result with summary parsing | `job_id`, `wait_seconds`, `inline_limit`, `full_reply` |
-| `dsh_worker_cancel` | Terminate running task and release its CWD lock | `job_id` |
-| `dsh_worker_config` | Inspect or override session configuration | `persistent_sessions`, `default_tier`, `mode`, `report_dir`, `preset_flash`, `preset_pro`, etc. |
-| `dsh_worker_probe` | Test route connectivity with a no-op tool call | `tier`, `provider`, `model` |
-| `dsh_session_close` | Explicitly destroy persistent session with tombstone | `session_id` |
+| `dsh_run_worker` | Blocking execution (supports persistent sessions) | `task`, `tier`, `effort`, `cwd`, `timeout_seconds`, `permission`, `preset`, `allow_concurrent_cwd`, `persistent`, `session_id`, `inline_limit`, `full_reply` |
+| `dsh_spawn_worker` | Asynchronous background dispatch (one-shot only) | `task`, `tier`, `effort`, `cwd`, `permission`, `preset`, `allow_concurrent_cwd` |
+| `dsh_worker_status` | List live Hub / Standalone / CLI jobs & CWD locks | *(none)* |
+| `dsh_worker_result` | Retrieve settled output with summary extraction | `job_id`, `wait_seconds`, `inline_limit`, `full_reply` |
+| `dsh_worker_cancel` | Terminate a running worker and release its CWD lock | `job_id` |
+| `dsh_worker_config` | Inspect or override session configuration at runtime | `persistent_sessions`, `default_tier`, `mode`, `report_dir`, `preset_flash`, `preset_pro`, `flash_provider`, `flash_model`, `reset`, etc. |
+| `dsh_worker_probe` | Zero-side-effect no-op tool-call route probe | `tier`, `provider`, `model` |
+| `dsh_session_close` | Explicitly destroy a persistent session (tombstone) | `session_id` |
 
 <details>
-<summary><strong>⚙️ Configuration & Environment Variables (Click to expand)</strong></summary>
+<summary><strong>⚙️ Configuration, Environment Variables &amp; Verification Gates</strong></summary>
 
-#### Configuration File: `~/.config/dsh-crew/config.json`
+#### Global Config: `~/.config/dsh-crew/config.json`
 ```jsonc
 {
   "mode": "auto",                                    // auto | hub | standalone
   "default_tier": "flash",                           // flash | pro
   "default_effort": "high",                          // off | high | max
-  "persistent_sessions": false,                      // Global toggle for persistent sessions
-  "persistent_session_idle_timeout_enabled": true,   // Auto-reap idle sessions toggle
-  "persistent_session_idle_timeout_minutes": 30,     // Idle timeout threshold (1-1440 min)
-  "preset_flash": "default",                         // Agent preset for Flash tier
-  "preset_pro": "default",                           // Agent preset for Pro tier
-  "report_dir": ""                                   // Custom path for reports (empty = default)
+  "persistent_sessions": false,                      // Global opt-in toggle
+  "persistent_session_idle_timeout_enabled": true,   // Auto-reap idle sessions
+  "persistent_session_idle_timeout_minutes": 30,     // Idle threshold (1–1440 min)
+  "preset_flash": "default",                         // DSH agent preset for flash
+  "preset_pro": "default",                           // DSH agent preset for pro
+  "report_dir": ""                                   // Custom report path (empty = <cwd>/.dsh-reports/)
 }
 ```
 
-#### Key Environment Variables
-- `DSH_CREW_MAX_PERMISSION`: Caps maximum permissible sandbox privileges (`read-only` \| `workspace-write` \| `auto` \| `full-access`).
-- `DSHPLUGIN_CREW_HUB`: Override URL to force a fixed Hub loopback address.
-- `DSH_CREW_ORIGIN_CHAIN` / `DSH_CREW_DEPTH`: Protects against cyclic dispatch loops and recursion deadlocks.
+#### Environment Variables
+- `DSH_CREW_MAX_PERMISSION`: Enforces non-escalating permission ceiling (`read-only` | `workspace-write` | `auto` | `full-access`).
+- `DSHPLUGIN_CREW_HUB`: Overrides `hub.json` discovery with a fixed loopback Hub URL.
+- `DSH_CREW_ORIGIN_CHAIN` / `DSH_CREW_DEPTH`: Tracks cross-process dispatch chains to block cycles and limit recursion depth (default `3`).
+
+#### Local Verification Gates
+```bash
+npx tsc -p tsconfig.client.json --noEmit
+npm run build
+npm test
+node scripts/verify-wpc10-client.mjs
+npm run smoke:cwd
+npm run smoke:mcp
+```
 
 </details>
 
@@ -237,9 +278,7 @@ flowchart LR
 
 ## 📄 License & Credits
 
-This project is licensed under the **[MIT License](LICENSE)**.
+Licensed under the **[MIT License](LICENSE)**.
 
-- Upstream Copyright: Copyright (c) 2026 ZSeven-W
-- Enhanced Fork Copyright: Copyright (c) 2026 xiaobaijiadepugongyingpai-coder
-
-Our sincere gratitude to the upstream [ZSeven-W/dsh-crew](https://github.com/ZSeven-W/dsh-crew) community for providing the foundational architecture.
+- **Upstream**: Copyright (c) 2026 [ZSeven-W](https://github.com/ZSeven-W/dsh-crew)
+- **Fork Enhancements**: Copyright (c) 2026 [xiaobaijiadepugongyingpai-coder](https://github.com/xiaobaijiadepugongyingpai-coder)

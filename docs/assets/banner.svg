@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 280" width="1200" height="280">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b101b" />
+      <stop offset="55%" stop-color="#111827" />
+      <stop offset="100%" stop-color="#0d1520" />
+    </linearGradient>
+    <radialGradient id="glow-blue" cx="0.2" cy="0.3" r="0.55">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glow-green" cx="0.88" cy="0.75" r="0.5">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.16" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#60a5fa" />
+      <stop offset="50%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+    <linearGradient id="pill-bg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1e293b" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+  </defs>
+
+  <style>
+    .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 800; font-size: 46px; fill: #f8fafc; letter-spacing: -0.8px; }
+    .subtitle { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 400; font-size: 18px; fill: #94a3b8; }
+    .badge-txt { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; font-size: 14px; fill: #60a5fa; }
+    .chip-txt { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 600; font-size: 12.5px; fill: #cbd5e1; }
+  </style>
+
+  <!-- Canvas -->
+  <rect width="1200" height="280" rx="18" fill="url(#bg)" stroke="#1e293b" stroke-width="1.5" />
+  <rect width="1200" height="280" rx="18" fill="url(#glow-blue)" />
+  <rect width="1200" height="280" rx="18" fill="url(#glow-green)" />
+
+  <!-- Subtle Grid Dots -->
+  <g fill="#334155" opacity="0.35">
+    <circle cx="1040" cy="44" r="1.5" /><circle cx="1064" cy="44" r="1.5" /><circle cx="1088" cy="44" r="1.5" /><circle cx="1112" cy="44" r="1.5" /><circle cx="1136" cy="44" r="1.5" />
+    <circle cx="1040" cy="68" r="1.5" /><circle cx="1064" cy="68" r="1.5" /><circle cx="1088" cy="68" r="1.5" /><circle cx="1112" cy="68" r="1.5" /><circle cx="1136" cy="68" r="1.5" />
+    <circle cx="1040" cy="92" r="1.5" /><circle cx="1064" cy="92" r="1.5" /><circle cx="1088" cy="92" r="1.5" /><circle cx="1112" cy="92" r="1.5" /><circle cx="1136" cy="92" r="1.5" />
+  </g>
+
+  <!-- Left Geometric Orchestrator Emblem -->
+  <g transform="translate(64, 58)">
+    <rect width="164" height="164" rx="34" fill="#0f172a" stroke="url(#accent)" stroke-width="2" />
+    <!-- Central Hub Ring -->
+    <circle cx="82" cy="86" r="34" fill="none" stroke="url(#accent)" stroke-width="3.5" opacity="0.9" />
+    <circle cx="82" cy="86" r="12" fill="url(#accent)" />
+    <!-- Branching Worker Nodes -->
+    <line x1="82" y1="52" x2="82" y2="30" stroke="#60a5fa" stroke-width="3" stroke-linecap="round" />
+    <circle cx="82" cy="24" r="7" fill="#60a5fa" />
+
+    <line x1="52" y1="103" x2="33" y2="115" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" />
+    <circle cx="27" cy="119" r="7" fill="#38bdf8" />
+
+    <line x1="112" y1="103" x2="131" y2="115" stroke="#34d399" stroke-width="3" stroke-linecap="round" />
+    <circle cx="137" cy="119" r="7" fill="#34d399" />
+
+    <!-- Subtle Persistent Loop Arc -->
+    <path d="M 52 64 A 38 38 0 0 1 112 64" fill="none" stroke="#93c5fd" stroke-width="2" stroke-dasharray="4 4" opacity="0.7" />
+  </g>
+
+  <!-- Title + Version Pill -->
+  <g transform="translate(264, 108)">
+    <text x="0" y="0" class="title">DSH Crew X</text>
+    <g transform="translate(274, -33)">
+      <rect width="84" height="30" rx="15" fill="#172554" stroke="#3b82f6" stroke-width="1.2" />
+      <text x="42" y="20" text-anchor="middle" class="badge-txt">v0.2.0</text>
+    </g>
+    <text x="0" y="38" class="subtitle">Production-Grade DeepSeek Harness (DSH) Multi-Agent Orchestrator</text>
+  </g>
+
+  <!-- Capability Chips -->
+  <g transform="translate(264, 182)">
+    <g transform="translate(0, 0)">
+      <rect width="154" height="34" rx="8" fill="url(#pill-bg)" stroke="#334155" stroke-width="1" />
+      <circle cx="16" cy="17" r="4" fill="#60a5fa" />
+      <text x="28" y="21.5" class="chip-txt">Persistent Sessions</text>
+    </g>
+    <g transform="translate(166, 0)">
+      <rect width="174" height="34" rx="8" fill="url(#pill-bg)" stroke="#334155" stroke-width="1" />
+      <circle cx="16" cy="17" r="4" fill="#34d399" />
+      <text x="28" y="21.5" class="chip-txt">Dynamic Hub Discovery</text>
+    </g>
+    <g transform="translate(352, 0)">
+      <rect width="164" height="34" rx="8" fill="url(#pill-bg)" stroke="#334155" stroke-width="1" />
+      <circle cx="16" cy="17" r="4" fill="#f59e0b" />
+      <text x="28" y="21.5" class="chip-txt">4-Tier Sandbox Policy</text>
+    </g>
+    <g transform="translate(528, 0)">
+      <rect width="164" height="34" rx="8" fill="url(#pill-bg)" stroke="#334155" stroke-width="1" />
+      <circle cx="16" cy="17" r="4" fill="#a78bfa" />
+      <text x="28" y="21.5" class="chip-txt">Windows Auto-Worktree</text>
+    </g>
+    <g transform="translate(704, 0)">
+      <rect width="146" height="34" rx="8" fill="url(#pill-bg)" stroke="#334155" stroke-width="1" />
+      <circle cx="16" cy="17" r="4" fill="#38bdf8" />
+      <text x="28" y="21.5" class="chip-txt">Report Auto-Offload</text>
+    </g>
+  </g>
+</svg>

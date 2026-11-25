@@ -40,7 +40,7 @@ Initial Hard Fork release from upstream `ZSeven-W/dsh-crew` (`0.1.0-rc.15` at co
   - Added automatic result offloading: settled outputs exceeding `inline_limit` (default 1500 tokens / 4000 characters) or failed tasks are automatically written to `<cwd>/.dsh-reports/` with `.gitignore` managed idempotently, saving 85%+ host context window.
 
 - **Antigravity Fine-Grained Permissions**:
-  - Split MCP tools into Safe (4 low-risk query tools auto-allowed) and Sensitive (3 dispatch/cancel tools asking by default).
+  - Split MCP tools into Safe (4 low-risk query tools auto-allowed) and Sensitive (4 dispatch/cancel/session tools asking by default).
   - Added CLI flag `--agy-permissions=safe|all|none` and one-click rule copier for Antigravity Desktop App `Global Permissions`.
 
 - **Concurrent Read-Only Execution**:
