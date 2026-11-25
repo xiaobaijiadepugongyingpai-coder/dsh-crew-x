@@ -26,36 +26,50 @@ const presetSchema = z.string().optional().describe('Optional hub-mode agent pre
 const inlineLimitSchema = z.number().int().positive().optional().describe('Override the inline output-token threshold (default 1500 tokens; char threshold scales proportionally as round(inline_limit * 4000 / 1500), default 4000 chars). Outputs exceeding the threshold are offloaded to report_path with only summary + stats returned unless full_reply=true.');
 const fullReplySchema = z.boolean().optional().describe('When true, keep the full result text inline even when offloaded to report_path or when the job failed.');
 
-// Session-level configuration. This MCP server process lives exactly as long
-// as one Claude Code / Codex session, so plain memory IS session scope.
-// Initial values come from the global config (~/.config/dsh-crew/config.json,
-// edited on the DSH settings page); dsh_worker_config overrides per session.
+// Session-level configuration. This MCP server process lives as long as one
+// Claude Code / Codex / Antigravity session, while users may edit global
+// defaults (~/.config/dsh-crew/config.json) live in the DSH settings panel.
+// `syncSessionConfig()` re-reads global config on each dispatch and layers
+// explicit per-session overrides from `dsh_worker_config` on top, so panel
+// edits take effect immediately without restarting the host IDE.
 import { readGlobalConfig } from './install/install.mjs';
 import { describeBindings, resolveTierBinding } from './tier-binding.mjs';
-const globalDefaults = readGlobalConfig();
-const sessionConfig = {
-  enabled: true,
-  default_tier: globalDefaults.default_tier,
-  default_effort: globalDefaults.default_effort,
-  mode: globalDefaults.mode, // auto | hub | standalone
-  default_timeout_seconds: globalDefaults.default_timeout_seconds,
-  tier_policy: globalDefaults.tier_policy, // auto | flash-only | pro-only
-  escalate_on_failure: globalDefaults.escalate_on_failure,
-  preset_flash: globalDefaults.preset_flash ?? 'default',
-  preset_pro: globalDefaults.preset_pro ?? 'default',
-  report_dir: globalDefaults.report_dir ?? '',
-  // Tier -> LLM route. A provider id names a route the HOST already has
-  // configured; blank means the tier's built-in DeepSeek default (#10).
-  flash_provider: globalDefaults.flash_provider ?? '',
-  flash_model: globalDefaults.flash_model ?? '',
-  pro_provider: globalDefaults.pro_provider ?? '',
-  pro_model: globalDefaults.pro_model ?? '',
-  // WPC9: max worker→worker nesting depth before a dispatch is refused.
-  origin_depth_limit: DEFAULT_ORIGIN_DEPTH_LIMIT,
-  // Opt-in persistent DSH sessions (hub mode only). Off unless the global
-  // config turns it on, so an existing install keeps its one-shot behaviour.
-  persistent_sessions: globalDefaults.persistent_sessions ?? false,
-};
+
+const sessionOverrides = Object.create(null);
+
+function buildSessionConfig(base, overrides) {
+  return {
+    enabled: true,
+    default_tier: base.default_tier,
+    default_effort: base.default_effort,
+    mode: base.mode, // auto | hub | standalone
+    default_timeout_seconds: base.default_timeout_seconds,
+    tier_policy: base.tier_policy, // auto | flash-only | pro-only
+    escalate_on_failure: base.escalate_on_failure,
+    preset_flash: base.preset_flash ?? 'default',
+    preset_pro: base.preset_pro ?? 'default',
+    report_dir: base.report_dir ?? '',
+    // Tier -> LLM route. A provider id names a route the HOST already has
+    // configured; blank means the tier's built-in DeepSeek default (#10).
+    flash_provider: base.flash_provider ?? '',
+    flash_model: base.flash_model ?? '',
+    pro_provider: base.pro_provider ?? '',
+    pro_model: base.pro_model ?? '',
+    // WPC9: max worker→worker nesting depth before a dispatch is refused.
+    origin_depth_limit: DEFAULT_ORIGIN_DEPTH_LIMIT,
+    // Opt-in persistent DSH sessions (hub mode only). Off unless the global
+    // config turns it on, so an existing install keeps its one-shot behaviour.
+    persistent_sessions: base.persistent_sessions ?? false,
+    ...overrides,
+  };
+}
+
+const sessionConfig = buildSessionConfig(readGlobalConfig(), sessionOverrides);
+
+function syncSessionConfig() {
+  Object.assign(sessionConfig, buildSessionConfig(readGlobalConfig(), sessionOverrides));
+  return sessionConfig;
+}
 
 /** The {provider, model} this session dispatches `tier` to. */
 function bindingForTier(tier) {
@@ -301,6 +315,7 @@ server.registerTool('dsh_run_worker', {
     session_id: z.string().optional().describe('Append this task as the NEXT turn on an existing persistent session (the session_id a previous persistent: true call returned). The session keeps its locked cwd and agent preset: pass the same cwd, and omit preset unless it is the identical one you created the session with. A busy session fails with SESSION_BUSY; a closed one with SESSION_CLOSED. Never combine with persistent: true.'),
   },
 }, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd, permission, preset, inline_limit, full_reply, persistent, session_id }) => {
+  syncSessionConfig();
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const e = effort ?? sessionConfig.default_effort;
@@ -518,6 +533,7 @@ server.registerTool('dsh_worker_probe', {
   description: 'Explicitly test one DSH-configured provider/model with a small no-op tool-call request. Requires the hub. Does not start a worker, touch files, or change bindings; it may consume one model request. A listed provider is not proof of agent/tool support. Results are observations at checked_at, not a permanent capability guarantee.',
   inputSchema: { tier: z.enum(['flash', 'pro']).optional(), provider: z.string().optional(), model: z.string().optional() },
 }, async ({ tier, provider, model }) => {
+  syncSessionConfig();
   if (!(await hubAvailable())) return text({ status: 'hub_unavailable', tool_call_verified: false });
   const bound = bindingForTier(tier ?? sessionConfig.default_tier);
   return text(await hub.probe({ provider: provider?.trim() || bound.provider, model: model?.trim() || bound.model }));
@@ -547,10 +563,10 @@ server.registerTool('dsh_worker_config', {
   },
 }, async ({ reset, ...patch }) => {
   if (reset) {
-    Object.assign(sessionConfig, { enabled: true, ...globalDefaults });
-    sessionConfig.origin_depth_limit = DEFAULT_ORIGIN_DEPTH_LIMIT;
+    for (const k of Object.keys(sessionOverrides)) delete sessionOverrides[k];
   }
-  for (const [k, v] of Object.entries(patch)) if (v !== undefined) sessionConfig[k] = v;
+  for (const [k, v] of Object.entries(patch)) if (v !== undefined) sessionOverrides[k] = v;
+  syncSessionConfig();
   const reachable = await hubAvailable();
   const activeHubUrl = reachable ? redactHubUrl(getActiveHubUrl()) : null;
   // Only the hub can enumerate the host's LLM routes (this process has no
@@ -633,6 +649,7 @@ const spawnWorkerTool = server.registerTool('dsh_spawn_worker', {
   if ('persistent' in undeclared || 'session_id' in undeclared) {
     return codedRefusal(PERSISTENT_ASYNC_UNSUPPORTED, 'PERSISTENT_ASYNC_UNSUPPORTED');
   }
+  syncSessionConfig();
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const depthLimit = depthLimitNow();
@@ -738,6 +755,7 @@ server.registerTool('dsh_worker_result', {
     full_reply: fullReplySchema,
   },
 }, async ({ job_id, wait_seconds, inline_limit, full_reply }) => {
+  syncSessionConfig();
   if (job_id.startsWith('hub-')) {
     if (!(await hubAvailable())) return text({ error: 'hub not reachable' });
     const view = await hub.get(job_id, wait_seconds).catch((e) => ({ error: e.message }));
@@ -782,6 +800,7 @@ server.registerTool('dsh_session_close', {
     session_id: z.string().describe('The session_id a persistent: true dispatch returned'),
   },
 }, async ({ session_id }) => {
+  syncSessionConfig();
   // Feature flag first: while persistent sessions are off, that is the reason
   // nothing can be closed, whatever the argument looks like.
   if (!sessionConfig.persistent_sessions) return codedRefusal(PERSISTENT_SESSIONS_DISABLED, 'PERSISTENT_SESSIONS_DISABLED');

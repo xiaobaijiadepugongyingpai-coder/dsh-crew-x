@@ -107,7 +107,7 @@ export const GLOBAL_CONFIG_DEFAULTS = {
   pro_provider: '',
   pro_model: '',
   // Hub-mode agent preset per tier: 'default' follows the DSH roster default.
-  preset_flash: 'minimal',
+  preset_flash: 'default',
   preset_pro: 'default',
   // Directory for offloaded large/failed worker reports ('' = <cwd>/.dsh-reports).
   report_dir: '',
