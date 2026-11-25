@@ -50,7 +50,7 @@
 
   <!-- Top Header -->
   <text x="36" y="38" class="hdr-title">三端协同架构图</text>
-  <text x="36" y="58" class="hdr-sub">AI 编排宿主 &rarr; MCP Stdio Server（零依赖单文件）&rarr; DSH Hub 插件端（宿主 Realm 严格隔离）&rarr; DSH 设置面板</text>
+  <text x="36" y="58" class="hdr-sub">AI 编排宿主 → MCP Stdio Server（零依赖单文件）→ DSH Hub 插件端（宿主 Realm 严格隔离）→ DSH 设置面板</text>
 
   <!-- ==================== COLUMN 1: AI HOSTS ==================== -->
   <g transform="translate(36, 80)">

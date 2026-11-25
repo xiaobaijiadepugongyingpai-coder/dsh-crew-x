@@ -50,7 +50,7 @@
 
   <!-- Top Header -->
   <text x="36" y="38" class="hdr-title">Three-Surface Architecture</text>
-  <text x="36" y="58" class="hdr-sub">Host Orchestrator &rarr; MCP Stdio Server (Zero-Dependency Bundle) &rarr; DSH Hub Plugin (Host Realm Isolated) &rarr; Settings Web UI</text>
+  <text x="36" y="58" class="hdr-sub">Host Orchestrator → MCP Stdio Server (Zero-Dependency Bundle) → DSH Hub Plugin (Host Realm Isolated) → Settings Web UI</text>
 
   <!-- ==================== COLUMN 1: AI HOSTS ==================== -->
   <g transform="translate(36, 80)">
