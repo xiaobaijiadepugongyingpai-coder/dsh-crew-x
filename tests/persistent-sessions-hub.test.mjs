@@ -367,6 +367,149 @@ test('tier and effort switch between turns through the shared selection', async 
   assert.equal(fake.log.creates.length, 1);
 });
 
+test('newer dsh-agent step-preparation invariant: cross-turn and post-resume switches call agent.model.select() before followup', async () => {
+  const modelSelectCalls = [];
+  const makeStrictAgent = ({ sessionId, options, persistedModel = null }) => {
+    let activeModel = persistedModel ?? {
+      provider: options.provider,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+    };
+    const listeners = {};
+    const session = {
+      header: { cwd: ISOLATED_HOME, agentPreset: 'pro-preset' },
+      events: [],
+      async append() {},
+    };
+    const emit = (type, data) => {
+      for (const fn of listeners['session/event'] ?? []) fn(session, { type, data });
+    };
+    const fail = (error) => {
+      for (const fn of listeners['agent/error'] ?? []) fn({ error });
+    };
+    let pending = null;
+    const agent = {
+      session,
+      id: sessionId,
+      model: {
+        current() { return { ...activeModel }; },
+        select(sel) {
+          modelSelectCalls.push({ sessionId, ...sel });
+          activeModel = { ...sel };
+        },
+      },
+      async whenIdle() { await pending; },
+      followup() {
+        // Step preparation snapshots `agent.model.current()` BEFORE hooks run.
+        const fixed = agent.model.current();
+        pending = Promise.resolve().then(async () => {
+          let assembled = { variables: {} };
+          for (const fn of listeners['system-prompt/assemble'] ?? []) {
+            assembled = await fn({ variables: {} }, undefined, async () => assembled);
+          }
+          let req = {};
+          for (const fn of listeners['agent/request'] ?? []) {
+            req = await fn({}, async () => ({}));
+          }
+          if (req.provider !== fixed.provider || req.model !== fixed.model || req.reasoningEffort !== fixed.reasoningEffort) {
+            const err = new Error(
+              `agent "${sessionId}": agent/request proposed "${req.provider}/${req.model}" after step preparation fixed "${fixed.provider}/${fixed.model}"; use agent.model.select() before step preparation`,
+            );
+            fail(err);
+            emit('turn/end', { reason: { kind: 'error' } });
+            return;
+          }
+          emit('assistant/message', { message: { content: [{ type: 'text', text: `${fixed.provider}/${fixed.model}/${fixed.reasoningEffort}` }] } });
+          emit('turn/end', { reason: { kind: 'completed' } });
+        });
+      },
+      cancel() {},
+    };
+    return {
+      agent,
+      listeners,
+      session,
+      async dispose() {},
+    };
+  };
+
+  let created = null;
+  let resumed = null;
+  const ctx = {
+    logger: { warn() {}, info() {} },
+    get(name) {
+      if (name === 'agentPresets') return { async resolve(id) { return { id: id ?? 'builtin-default' }; }, async mount() {} };
+      return undefined;
+    },
+    sessions: { async flush() {} },
+    agents: {
+      async create(opts) {
+        created = makeStrictAgent({ sessionId: opts.sessionId, options: opts.agentOptions });
+        await opts.setup({
+          agent: created.agent,
+          on(name, fn) { (created.listeners[name] ??= []).push(fn); },
+        });
+        return { agent: created.agent, dispose: created.dispose };
+      },
+      async resume(opts) {
+        // Simulate a persisted JSONL log whose lastUsed selection was `pro-model`.
+        resumed = makeStrictAgent({
+          sessionId: opts.resumeSessionId,
+          options: opts.agentOptions,
+          persistedModel: { provider: 'deepseek-official', model: 'pro-model', reasoningEffort: 'high' },
+        });
+        await opts.setup({
+          agent: resumed.agent,
+          on(name, fn) { (resumed.listeners[name] ??= []).push(fn); },
+        });
+        return { agent: resumed.agent, dispose: resumed.dispose };
+      },
+    },
+  };
+
+  const registry = new WorkerRegistry({ ...ctx }, { publish() {} }, { reaperIntervalMs: 0 });
+  registry.getConfig = () => ({
+    preset_flash: 'flash-preset', preset_pro: 'pro-preset',
+    flash_model: 'flash-model', pro_model: 'pro-model',
+  });
+
+  // Turn 1: pro/high — matches agentOptions, so no redundant model.select() needed.
+  const t1 = await registry.spawn({ task: 'turn1', cwd: ISOLATED_HOME, tier: 'pro', effort: 'high', persistent: true });
+  await t1.promise;
+  assert.equal(t1.status, 'done');
+  assert.equal(t1.result, 'deepseek-official/pro-model/high');
+  assert.equal(modelSelectCalls.length, 0);
+
+  // Turn 2: switch pro -> flash (the exact failing scenario on newer DSH Desktop).
+  const t2 = await registry.spawn({ task: 'turn2', sessionId: t1.sessionId, tier: 'flash', effort: 'high' });
+  await t2.promise;
+  assert.equal(t2.status, 'done', `expected turn2 done, got ${t2.status}: ${t2.error}`);
+  assert.equal(t2.result, 'deepseek-official/flash-model/high');
+  assert.equal(modelSelectCalls.length, 1);
+  assert.deepEqual(modelSelectCalls[0], {
+    sessionId: t1.sessionId, provider: 'deepseek-official', model: 'flash-model', reasoningEffort: 'high',
+  });
+
+  // Turn 3: effort-only change (high -> off) must also sync model.select().
+  const t3 = await registry.spawn({ task: 'turn3', sessionId: t1.sessionId, tier: 'flash', effort: 'off' });
+  await t3.promise;
+  assert.equal(t3.status, 'done', `expected turn3 done, got ${t3.status}: ${t3.error}`);
+  assert.equal(t3.result, 'deepseek-official/flash-model/off');
+  assert.equal(modelSelectCalls.length, 2);
+
+  // Turn 4: simulate Hub restart by clearing in-memory session pool and resuming with tier='flash',
+  // while persisted session still records `pro-model`. `model.select()` must update it before followup.
+  registry.persistentSessions.clear();
+  const t4 = await registry.spawn({ task: 'turn4', cwd: ISOLATED_HOME, sessionId: t1.sessionId, tier: 'flash', effort: 'max' });
+  await t4.promise;
+  assert.equal(t4.status, 'done', `expected resumed turn4 done, got ${t4.status}: ${t4.error}`);
+  assert.equal(t4.result, 'deepseek-official/flash-model/max');
+  assert.equal(modelSelectCalls.length, 3);
+  assert.deepEqual(modelSelectCalls[2], {
+    sessionId: t1.sessionId, provider: 'deepseek-official', model: 'flash-model', reasoningEffort: 'max',
+  });
+});
+
 test('permission switches between turns by appending a new sandbox/mode before the followup', async () => {
   const fake = makeCtx();
   const registry = makeRegistry(fake);

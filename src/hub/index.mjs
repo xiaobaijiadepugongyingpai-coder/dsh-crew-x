@@ -649,6 +649,26 @@ export class WorkerRegistry {
       if (typeof handle?.agent?.session?.append !== 'function') {
         throw new Error('agent session does not support sandbox/mode append');
       }
+      // Newer DSH agent runtimes fix the step's {provider, model, reasoningEffort}
+      // during step preparation and reject an `agent/request` override that differs
+      // from it. Sync `agent.model.select()` before `followup()` so cross-turn tier,
+      // model, or effort switches take effect cleanly on both live and resumed handles.
+      const selected = rec.selectionRef?.current;
+      const agentModel = handle?.agent?.model;
+      if (typeof agentModel?.select === 'function' && selected?.provider && selected?.model) {
+        const current = typeof agentModel.current === 'function' ? agentModel.current() : undefined;
+        const matchesCurrent = current !== undefined
+          && current.provider === selected.provider
+          && current.model === selected.model
+          && current.reasoningEffort === selected.reasoningEffort;
+        if (!matchesCurrent) {
+          await agentModel.select({
+            provider: selected.provider,
+            model: selected.model,
+            ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+          });
+        }
+      }
       // Sandbox level is a per-turn choice on a persistent session: append the
       // new mode before the followup so this turn runs under it.
       await handle.agent.session.append('sandbox/mode', { mode: perm.effective_sandbox_mode });
