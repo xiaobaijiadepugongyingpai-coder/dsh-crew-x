@@ -35,14 +35,14 @@
 `dsh-crew-x` mounts directly into the **DSH Settings Panel** as both a visual configuration center and a live multi-workspace jobs board:
 
 <p align="center">
-  <img src="docs/assets/hero-dispatch-en.png" alt="DSH Crew X Dispatch Policy & Tier Model Bindings" width="100%" />
+  <img src="docs/assets/hero-dispatch.png" alt="DSH Crew X Dispatch Policy & Tier Model Bindings" width="100%" />
 </p>
-<p align="center"><sub>Visual <code>flash</code> / <code>pro</code> provider &amp; model bindings with one-click no-op tool-call route verification</sub></p>
+<p align="center"><sub>Real DSH Desktop UI: visual <code>flash</code> / <code>pro</code> provider &amp; model bindings, preset controls, route probe, and opt-in persistent session settings</sub></p>
 
 <p align="center">
-  <img src="docs/assets/hero-sessions-en.png" alt="DSH Crew X Active Persistent Sessions & Worker Jobs Board" width="100%" />
+  <img src="docs/assets/hero-sessions.png" alt="DSH Crew X Active Persistent Sessions & Worker Jobs Board" width="100%" />
 </p>
-<p align="center"><sub>Live persistent session pool (with Windows ACL <code>worktree</code> degradation badges) &amp; per-workspace jobs grouping (<code>↻ session #turn</code> &amp; <code>🔒</code> CWD lock)</sub></p>
+<p align="center"><sub>Real DSH Desktop UI: live persistent session pool &amp; per-workspace worker jobs grouping (<code>↻ session #turn</code> badges &amp; parallel read-only tasks)</sub></p>
 
 ---
 

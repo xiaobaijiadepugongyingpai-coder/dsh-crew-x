@@ -35,14 +35,14 @@
 `dsh-crew-x` 直接集成在 **DSH 设置面板**中，提供可视化模型路由探测、持久会话池管理与按工作区聚合的实时看板：
 
 <p align="center">
-  <img src="docs/assets/hero-dispatch-zh.png" alt="DSH Crew X 派发策略与模型路由绑定" width="100%" />
+  <img src="docs/assets/hero-dispatch.png" alt="DSH Crew X 派发策略与模型路由绑定" width="100%" />
 </p>
-<p align="center"><sub><code>flash</code> / <code>pro</code> 可视化 Provider 与模型选择，支持一键发送无副作用 tool-call 探针验证真实连通性</sub></p>
+<p align="center"><sub>DSH Desktop 实机截图：<code>flash</code> / <code>pro</code> 可视化 Provider 与模型选择、预设绑定、一键连通性探针与持久会话开关</sub></p>
 
 <p align="center">
-  <img src="docs/assets/hero-sessions-zh.png" alt="DSH Crew X 活跃持久会话与 Worker 任务看板" width="100%" />
+  <img src="docs/assets/hero-sessions.png" alt="DSH Crew X 活跃持久会话与 Worker 任务看板" width="100%" />
 </p>
-<p align="center"><sub>活跃持久会话池（含 Windows ACL 降级 <code>worktree</code> 徽章）与按工作区聚合的任务看板（<code>↻ 会话 #轮次</code> 与 <code>🔒</code> 目录写锁）</sub></p>
+<p align="center"><sub>DSH Desktop 实机截图：活跃持久会话池与按工作区聚合的任务看板（<code>↻ 会话 #轮次</code> 徽章与并发只读任务）</sub></p>
 
 ---
 
