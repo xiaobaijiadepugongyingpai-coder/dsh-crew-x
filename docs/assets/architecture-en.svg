@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 540" width="1200" height="540">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b101b" />
+      <stop offset="100%" stop-color="#101726" />
+    </linearGradient>
+    <linearGradient id="col-host" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#172033" />
+      <stop offset="100%" stop-color="#111827" />
+    </linearGradient>
+    <linearGradient id="col-mcp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#142238" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+    <linearGradient id="col-hub" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#122625" />
+      <stop offset="100%" stop-color="#0d181a" />
+    </linearGradient>
+    <linearGradient id="col-ui" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e1b33" />
+      <stop offset="100%" stop-color="#131222" />
+    </linearGradient>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#60a5fa" />
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399" />
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa" />
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b" />
+    </marker>
+  </defs>
+
+  <style>
+    .hdr-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 700; font-size: 18px; fill: #f1f5f9; }
+    .hdr-sub { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 12.5px; fill: #94a3b8; }
+    .col-tag { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; font-size: 10.5px; letter-spacing: 0.6px; }
+    .col-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 700; font-size: 15px; fill: #f8fafc; }
+    .col-path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: #64748b; }
+    .node-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; font-size: 12.5px; fill: #e2e8f0; }
+    .node-sub { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #94a3b8; }
+    .edge-lbl { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; font-size: 10.5px; }
+  </style>
+
+  <!-- Canvas -->
+  <rect width="1200" height="540" rx="16" fill="url(#bg)" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- Top Header -->
+  <text x="36" y="38" class="hdr-title">Three-Surface Architecture</text>
+  <text x="36" y="58" class="hdr-sub">Host Orchestrator &rarr; MCP Stdio Server (Zero-Dependency Bundle) &rarr; DSH Hub Plugin (Host Realm Isolated) &rarr; Settings Web UI</text>
+
+  <!-- ==================== COLUMN 1: AI HOSTS ==================== -->
+  <g transform="translate(36, 80)">
+    <rect width="204" height="356" rx="12" fill="url(#col-host)" stroke="#334155" stroke-width="1.2" />
+    <rect x="14" y="14" width="106" height="20" rx="5" fill="#1e293b" />
+    <text x="22" y="28" class="col-tag" fill="#94a3b8">1. AI HOSTS</text>
+    <text x="14" y="54" class="col-title">External Clients</text>
+    <text x="14" y="70" class="col-path">native subagent UI</text>
+
+    <g transform="translate(14, 86)">
+      <rect width="176" height="46" rx="8" fill="#0f172a" stroke="#334155" />
+      <circle cx="16" cy="23" r="4" fill="#60a5fa" />
+      <text x="28" y="20" class="node-title">Claude Code</text>
+      <text x="28" y="36" class="node-sub">plugin + claude-hud</text>
+    </g>
+    <g transform="translate(14, 142)">
+      <rect width="176" height="46" rx="8" fill="#0f172a" stroke="#334155" />
+      <circle cx="16" cy="23" r="4" fill="#38bdf8" />
+      <text x="28" y="20" class="node-title">OpenAI Codex</text>
+      <text x="28" y="36" class="node-sub">roles + prompts</text>
+    </g>
+    <g transform="translate(14, 198)">
+      <rect width="176" height="46" rx="8" fill="#0f172a" stroke="#334155" />
+      <circle cx="16" cy="23" r="4" fill="#34d399" />
+      <text x="28" y="20" class="node-title">Antigravity (agy)</text>
+      <text x="28" y="36" class="node-sub">persistent + allowlist</text>
+    </g>
+    <g transform="translate(14, 254)">
+      <rect width="176" height="46" rx="8" fill="#0f172a" stroke="#334155" />
+      <circle cx="16" cy="23" r="4" fill="#a78bfa" />
+      <text x="28" y="20" class="node-title">Grok Build CLI</text>
+      <text x="28" y="36" class="node-sub">config.toml + agents</text>
+    </g>
+    <text x="102" y="332" text-anchor="middle" class="node-sub" fill="#64748b">ds-flash / ds-pro shells</text>
+  </g>
+
+  <!-- Arrow 1: Hosts -> MCP -->
+  <g>
+    <line x1="242" y1="258" x2="298" y2="258" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow-blue)" />
+    <rect x="247" y="232" width="48" height="18" rx="4" fill="#172554" stroke="#3b82f6" stroke-opacity="0.5" />
+    <text x="271" y="244" text-anchor="middle" class="edge-lbl" fill="#93c5fd">stdio</text>
+  </g>
+
+  <!-- ==================== COLUMN 2: MCP SERVER ==================== -->
+  <g transform="translate(304, 80)">
+    <rect width="270" height="356" rx="12" fill="url(#col-mcp)" stroke="#1d4ed8" stroke-opacity="0.55" stroke-width="1.2" />
+    <rect x="14" y="14" width="128" height="20" rx="5" fill="#172554" />
+    <text x="22" y="28" class="col-tag" fill="#60a5fa">2. MCP SERVER</text>
+    <text x="14" y="54" class="col-title">Stdio Orchestrator</text>
+    <text x="14" y="70" class="col-path">lib/server.mjs (8 tools)</text>
+
+    <g transform="translate(14, 86)">
+      <rect width="242" height="44" rx="8" fill="#0b1324" stroke="#1e3a8a" />
+      <text x="12" y="19" class="node-title">Tool Router &amp; Origin Guard</text>
+      <text x="12" y="35" class="node-sub">cycle detection &amp; depth limit (3)</text>
+    </g>
+    <g transform="translate(14, 138)">
+      <rect width="242" height="44" rx="8" fill="#0b1324" stroke="#1e3a8a" />
+      <text x="12" y="19" class="node-title">Workspace CWD Advisory Lock</text>
+      <text x="12" y="35" class="node-sub">write mutex / concurrent read-only</text>
+    </g>
+    <g transform="translate(14, 190)">
+      <rect width="242" height="44" rx="8" fill="#0b1324" stroke="#1e3a8a" />
+      <text x="12" y="19" class="node-title">4-Tier Permission Policy</text>
+      <text x="12" y="35" class="node-sub">ceiling + auto-worktree fallback</text>
+    </g>
+    <g transform="translate(14, 242)">
+      <rect width="242" height="44" rx="8" fill="#0b1324" stroke="#1e3a8a" />
+      <text x="12" y="19" class="node-title">Summary Contract &amp; Offload</text>
+      <text x="12" y="35" class="node-sub">VERDICT/CHANGED + .dsh-reports/</text>
+    </g>
+    <g transform="translate(14, 294)">
+      <rect width="242" height="44" rx="8" fill="#0b1324" stroke="#2563eb" stroke-opacity="0.7" />
+      <text x="12" y="19" class="node-title" fill="#93c5fd">Dynamic Hub Discovery Client</text>
+      <text x="12" y="35" class="node-sub">hub.json + CAS hot reconnect</text>
+    </g>
+  </g>
+
+  <!-- Arrow 2: MCP -> Hub -->
+  <g>
+    <line x1="576" y1="258" x2="646" y2="258" stroke="#34d399" stroke-width="2" marker-end="url(#arrow-emerald)" />
+    <rect x="579" y="228" width="64" height="22" rx="4" fill="#064e3b" stroke="#10b981" stroke-opacity="0.5" />
+    <text x="611" y="242" text-anchor="middle" class="edge-lbl" fill="#6ee7b7">HTTP/JSON</text>
+    <text x="611" y="274" text-anchor="middle" class="node-sub" fill="#6ee7b7">127.0.0.1</text>
+  </g>
+
+  <!-- ==================== COLUMN 3: DSH HUB ==================== -->
+  <g transform="translate(652, 80)">
+    <rect width="270" height="356" rx="12" fill="url(#col-hub)" stroke="#059669" stroke-opacity="0.55" stroke-width="1.2" />
+    <rect x="14" y="14" width="134" height="20" rx="5" fill="#064e3b" />
+    <text x="22" y="28" class="col-tag" fill="#34d399">3. DSH HUB</text>
+    <text x="14" y="54" class="col-title">DSH Host Plugin</text>
+    <text x="14" y="70" class="col-path">src/hub/index.mjs (zero SDK import)</text>
+
+    <g transform="translate(14, 86)">
+      <rect width="242" height="44" rx="8" fill="#091a18" stroke="#065f46" />
+      <text x="12" y="19" class="node-title">Loopback HTTP API</text>
+      <text x="12" y="35" class="node-sub">/_dsh/dsh-crew/* (strict 415)</text>
+    </g>
+    <g transform="translate(14, 138)">
+      <rect width="242" height="44" rx="8" fill="#091a18" stroke="#065f46" />
+      <text x="12" y="19" class="node-title">Atomic Port Broadcast</text>
+      <text x="12" y="35" class="node-sub">~/.config/dsh-crew/hub.json</text>
+    </g>
+    <g transform="translate(14, 190)">
+      <rect width="242" height="44" rx="8" fill="#091a18" stroke="#065f46" />
+      <text x="12" y="19" class="node-title">Persistent Session Pool</text>
+      <text x="12" y="35" class="node-sub">1:1 handles + ACL worktree marker</text>
+    </g>
+    <g transform="translate(14, 242)">
+      <rect width="242" height="44" rx="8" fill="#091a18" stroke="#065f46" />
+      <text x="12" y="19" class="node-title">Watchdog &amp; Idle Reaper</text>
+      <text x="12" y="35" class="node-sub">turnEpoch guard · 1–1440m TTL</text>
+    </g>
+    <g transform="translate(14, 294)">
+      <rect width="242" height="44" rx="8" fill="#091a18" stroke="#10b981" stroke-opacity="0.7" />
+      <text x="12" y="19" class="node-title" fill="#6ee7b7">Provider Catalog &amp; Probe</text>
+      <text x="12" y="35" class="node-sub">ctx.llm + no-op tool-call test</text>
+    </g>
+  </g>
+
+  <!-- Arrow 3: UI <-> Hub -->
+  <g>
+    <line x1="924" y1="258" x2="974" y2="258" stroke="#a78bfa" stroke-width="2" marker-start="url(#arrow-purple)" marker-end="url(#arrow-purple)" />
+    <rect x="927" y="232" width="44" height="18" rx="4" fill="#2e1065" stroke="#8b5cf6" stroke-opacity="0.5" />
+    <text x="949" y="244" text-anchor="middle" class="edge-lbl" fill="#ddd6fe">Fetch</text>
+  </g>
+
+  <!-- ==================== COLUMN 4: DSH WEB UI ==================== -->
+  <g transform="translate(980, 80)">
+    <rect width="184" height="356" rx="12" fill="url(#col-ui)" stroke="#6d28d9" stroke-opacity="0.55" stroke-width="1.2" />
+    <rect x="14" y="14" width="112" height="20" rx="5" fill="#2e1065" />
+    <text x="22" y="28" class="col-tag" fill="#c4b5fd">4. WEB UI</text>
+    <text x="14" y="54" class="col-title">Settings Panel</text>
+    <text x="14" y="70" class="col-path">lib/client.js</text>
+
+    <g transform="translate(14, 86)">
+      <rect width="156" height="54" rx="8" fill="#121024" stroke="#4c1d95" />
+      <text x="12" y="22" class="node-title">Host Installer</text>
+      <text x="12" y="39" class="node-sub">1-click + Agy rules</text>
+    </g>
+    <g transform="translate(14, 150)">
+      <rect width="156" height="54" rx="8" fill="#121024" stroke="#4c1d95" />
+      <text x="12" y="22" class="node-title">Tier Model Picker</text>
+      <text x="12" y="39" class="node-sub">flash/pro + Probe</text>
+    </g>
+    <g transform="translate(14, 214)">
+      <rect width="156" height="54" rx="8" fill="#121024" stroke="#4c1d95" />
+      <text x="12" y="22" class="node-title">Session Monitor</text>
+      <text x="12" y="39" class="node-sub">worktree + Close</text>
+    </g>
+    <g transform="translate(14, 278)">
+      <rect width="156" height="54" rx="8" fill="#121024" stroke="#4c1d95" />
+      <text x="12" y="22" class="node-title">Jobs Board</text>
+      <text x="12" y="39" class="node-sub">↻ #turn + 🔒 locks</text>
+    </g>
+  </g>
+
+  <!-- ==================== BOTTOM FALLBACK LANE ==================== -->
+  <g transform="translate(304, 456)">
+    <line x1="135" y1="-20" x2="135" y2="0" stroke="#f59e0b" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrow-amber)" />
+    <rect width="618" height="60" rx="10" fill="#1c1610" stroke="#92400e" stroke-opacity="0.7" />
+    <rect x="14" y="18" width="134" height="24" rx="6" fill="#451a03" stroke="#d97706" stroke-opacity="0.5" />
+    <text x="81" y="34" text-anchor="middle" class="col-tag" fill="#fbbf24">FALLBACK PATHS</text>
+    <text x="164" y="27" class="node-title" fill="#fde68a">Standalone SDK &amp; External CLI Dispatch (One-Shot Only)</text>
+    <text x="164" y="45" class="node-sub" fill="#d97706">dsh-jsonrpc-agent (worker.cordis.yml) when Hub offline · or explicit worker="agy" | "grok"</text>
+  </g>
+</svg>

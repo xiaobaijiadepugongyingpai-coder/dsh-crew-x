@@ -192,39 +192,9 @@ node src/install/cli.mjs grok                       # Grok Build CLI
 
 ## 🏗️ Architecture & MCP Reference
 
-```mermaid
-flowchart LR
-  subgraph Host["External AI Hosts"]
-    Orch["Claude Code / Codex / Antigravity / Grok"]
-  end
-
-  subgraph MCP["MCP Stdio Server (lib/server.mjs)"]
-    Router["Tool Dispatch & Validation"]
-    CwdLock["Workspace CWD Advisory Lock"]
-    Policy["4-Tier Permission Policy"]
-    Summary["Structured Summary Contract"]
-    Offload["Threshold Offload (.dsh-reports/)"]
-    HubCli["Dynamic Discovery & CAS Client"]
-  end
-
-  subgraph Hub["DSH Hub Plugin (src/hub/index.mjs)"]
-    Http["Loopback HTTP API (/_dsh/dsh-crew/*)"]
-    PortDisc["hub.json Live Port Broadcast"]
-    SessionPool["Persistent Session Pool"]
-    Reaper["Idle Session Reaper"]
-    Watchdog["Turn Watchdog (turnEpoch)"]
-  end
-
-  subgraph UI["DSH Settings Web UI (lib/client.js)"]
-    ModelUI["Tier Visual Selector & Probe"]
-    SessionUI["Active Session Monitor"]
-    JobsUI["Per-Workspace Jobs Board"]
-  end
-
-  Orch -->|"MCP stdio"| MCP
-  HubCli -->|"127.0.0.1 / hub.json"| Http
-  UI -->|"Loopback Fetch"| Http
-```
+<p align="center">
+  <img src="docs/assets/architecture-en.svg" alt="DSH Crew X Three-Surface Architecture" width="100%" />
+</p>
 
 ### 🛠️ 8 MCP Tools
 

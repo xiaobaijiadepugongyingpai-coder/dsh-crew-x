@@ -192,39 +192,9 @@ node src/install/cli.mjs grok                       # Grok Build CLI
 
 ## 🏗️ 架构与 MCP 工具参考
 
-```mermaid
-flowchart LR
-  subgraph Host["外部 AI 编排宿主"]
-    Orch["Claude Code / Codex / Antigravity / Grok"]
-  end
-
-  subgraph MCP["MCP Stdio Server (lib/server.mjs)"]
-    Router["工具分发与参数校验"]
-    CwdLock["工作区 CWD 互斥锁"]
-    Policy["4 档逐任务权限策略"]
-    Summary["结构化摘要注入与解析"]
-    Offload["超限结果落档 (.dsh-reports/)"]
-    HubCli["动态发现与 CAS 热重连客户端"]
-  end
-
-  subgraph Hub["DSH Hub 插件端 (src/hub/index.mjs)"]
-    Http["Loopback HTTP API (/_dsh/dsh-crew/*)"]
-    PortDisc["hub.json 动态端口广播"]
-    SessionPool["持久会话池"]
-    Reaper["空闲会话自动回收"]
-    Watchdog["轮次看门狗 (turnEpoch)"]
-  end
-
-  subgraph UI["DSH 设置面板 (lib/client.js)"]
-    ModelUI["Flash/Pro 可视化路由与探针"]
-    SessionUI["活跃持久会话监控"]
-    JobsUI["按工作区聚合的任务看板"]
-  end
-
-  Orch -->|"MCP stdio"| MCP
-  HubCli -->|"127.0.0.1 / hub.json"| Http
-  UI -->|"Loopback Fetch"| Http
-```
+<p align="center">
+  <img src="docs/assets/architecture-zh.svg" alt="DSH Crew X 三端协同架构图" width="100%" />
+</p>
 
 ### 🛠️ 8 个 MCP 工具一览
 
