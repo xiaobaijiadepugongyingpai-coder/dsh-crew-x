@@ -98,6 +98,7 @@ function run(cmd, args, { cwd, timeoutMs = 300_000, env = {} } = {}) {
       encoding: 'utf8',
       timeout: timeoutMs,
       maxBuffer: 64 * 1024 * 1024,
+      shell: process.platform === 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (err) {

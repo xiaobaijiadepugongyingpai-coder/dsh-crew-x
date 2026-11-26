@@ -139,10 +139,7 @@
     "README.md",
     "README.*.md",
     "CHANGELOG.md",
-    "docs/images/dsh-crew-logo.png",
-    "docs/images/dsh-crew-overview.png",
-    "docs/images/dsh-crew-host.png",
-    "docs/images/dsh-crew-jobs.png",
+    "docs/assets",
     "LICENSE"
   ],
   "publishConfig": {

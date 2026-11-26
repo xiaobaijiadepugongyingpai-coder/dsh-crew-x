@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/dsh-crew-x"><img src="https://img.shields.io/npm/v/dsh-crew-x?color=cb3837&label=npm" alt="npm version" /></a>
   <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/releases"><img src="https://img.shields.io/github/v/release/xiaobaijiadepugongyingpai-coder/dsh-crew-x?include_prereleases&color=2563eb&label=release" alt="GitHub Release" /></a>
   <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-16a34a.svg" alt="License: MIT" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A518.0.0-2563eb.svg" alt="Node.js >= 18" /></a>
@@ -147,27 +148,32 @@
 
 ## 🚀 快速上手
 
-### 1. 克隆并构建
+### 1. 通过 npm 安装到 DSH（推荐）
+
+直接从 npm 将 `dsh-crew-x` 安装到你的 DSH Profile：
+
+```bash
+dsh plugin --profile web add dsh-crew-x
+dsh web
+```
+
+<details>
+<summary>备选：从源码克隆构建并本地链接（适合二次开发）</summary>
 
 ```bash
 git clone https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x.git
 cd dsh-crew-x
 pnpm install
 npm run build
-```
-
-### 2. 挂载到 DSH 实例
-
-将构建好的仓库链接至你的 DSH Profile（推荐 Hub 模式）：
-
-```bash
 dsh plugin --profile web add link:/path/to/dsh-crew-x
 dsh web
 ```
 
+</details>
+
 > **仅 Standalone 回退需要密钥**：当本机未启动 DSH 实例时，若需独立进程回退运行，请在 `~/.config/dsh-crew/.env` 中配置 `DEEPSEEK_API_KEY`（参考 `.env.example`）。
 
-### 3. 一键接入外部 AI 编码宿主
+### 2. 一键接入外部 AI 编码宿主
 
 使用内置 CLI 安装器自动注入 MCP 服务、子代理角色、Skill 与分级权限白名单：
 

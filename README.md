@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/dsh-crew-x"><img src="https://img.shields.io/npm/v/dsh-crew-x?color=cb3837&label=npm" alt="npm version" /></a>
   <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/releases"><img src="https://img.shields.io/github/v/release/xiaobaijiadepugongyingpai-coder/dsh-crew-x?include_prereleases&color=2563eb&label=release" alt="GitHub Release" /></a>
   <a href="https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-16a34a.svg" alt="License: MIT" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A518.0.0-2563eb.svg" alt="Node.js >= 18" /></a>
@@ -147,27 +148,32 @@ Available in **DSH Hub + Antigravity** (opt-in via DSH Settings or `dsh_worker_c
 
 ## 🚀 Quick Start
 
-### 1. Clone & Build
+### 1. Install into DSH (npm — Recommended)
+
+Install `dsh-crew-x` directly into your DSH profile from npm:
+
+```bash
+dsh plugin --profile web add dsh-crew-x
+dsh web
+```
+
+<details>
+<summary>Alternative: Build &amp; link from source (for local development)</summary>
 
 ```bash
 git clone https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x.git
 cd dsh-crew-x
 pnpm install
 npm run build
-```
-
-### 2. Mount Plugin into DSH
-
-Link the built repository into your DSH profile (recommended for Hub mode):
-
-```bash
 dsh plugin --profile web add link:/path/to/dsh-crew-x
 dsh web
 ```
 
+</details>
+
 > **Standalone Fallback Only**: When no DSH instance is running, workers can fall back to standalone execution if `DEEPSEEK_API_KEY` is configured in `~/.config/dsh-crew/.env` (see `.env.example`).
 
-### 3. Connect External AI Hosts
+### 2. Connect External AI Hosts
 
 Use the built-in installer CLI to register the MCP server, role definitions, skills, and permissions:
 
