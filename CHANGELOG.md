@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.1] - 2026-11-27
+
+### 📦 Marketplace Readiness & Manifest Metadata
+
+- **DSH Plugin Market Metadata**:
+  - Declared `engines.dsh` (`>=0.1.0-rc.6 <1.0.0-0`), `dsh.manifestVersion: 1`, `dsh.catalog` (bilingual summary, `workflow` category, capabilities), and `dsh-plugin` npm keyword for compatibility with `@deepseek-ai/dsh-plugin-market-index`, `dsh-plugin-shop`, and `awesome-dsh-plugin`.
+  - Added 180×180 PNG storefront icon (`docs/assets/icon-180.png`, < 32 KiB) and `screenshots.json` referencing real DSH Desktop light-theme UI screenshots.
+  - Bumped package, `.claude-plugin/plugin.json`, and MCP server version to `0.2.1`.
+
+---
+
 ## [0.2.0] - 2026-11-23
 
 Initial Hard Fork release from upstream `ZSeven-W/dsh-crew` (`0.1.0-rc.15` at commit `b00cc6d`).

@@ -1,6 +1,6 @@
 {
   "name": "dsh-crew-x",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Production-grade DeepSeek Harness (DSH) worker orchestrator: dispatch work to native subagents with live progress, persistent sessions, per-task permissions, and Windows worktree isolation",
   "author": {
     "name": "xiaobaijiadepugongyingpai-coder"

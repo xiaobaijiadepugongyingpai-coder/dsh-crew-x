@@ -1,15 +1,21 @@
 {
   "name": "dsh-crew-x",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./src/hub/index.mjs",
+  "icon": "./docs/assets/icon-180.png",
   "description": "Production-grade DeepSeek Harness (DSH) worker orchestrator: dispatch work to native subagents with live progress, persistent sessions, per-task permissions, and Windows worktree isolation",
   "author": "xiaobaijiadepugongyingpai-coder <xiaobaijiadepugongyingpai@gmail.com>",
   "homepage": "https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x#readme",
   "bugs": {
     "url": "https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x/issues"
   },
+  "engines": {
+    "node": ">=18.0.0",
+    "dsh": ">=0.1.0-rc.6 <1.0.0-0"
+  },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -19,6 +25,21 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ],
       "platform": "web"
+    },
+    "catalog": {
+      "category": "workflow",
+      "summary": {
+        "en": "DSH worker orchestrator for Claude Code, Codex, Antigravity & Grok: persistent sessions, dynamic hub discovery, 4-tier permissions, Windows worktrees & report offload.",
+        "zh": "面向 Claude Code / Codex / Antigravity / Grok 的 DSH 编排器：支持持久会话、动态端口发现、4 档权限、Windows Worktree 降级与报告自动落档。"
+      },
+      "capabilities": [
+        "agents",
+        "llm",
+        "mcp",
+        "session",
+        "sandbox",
+        "ui-settings"
+      ]
     }
   },
   "scripts": {
@@ -104,6 +125,7 @@
     "url": "git+https://github.com/xiaobaijiadepugongyingpai-coder/dsh-crew-x.git"
   },
   "keywords": [
+    "dsh-plugin",
     "dsh",
     "deepseek",
     "deepseek-harness",
@@ -140,6 +162,7 @@
     "README.*.md",
     "CHANGELOG.md",
     "docs/assets",
+    "screenshots.json",
     "LICENSE"
   ],
   "publishConfig": {
